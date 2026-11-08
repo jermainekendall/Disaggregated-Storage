@@ -1,0 +1,115 @@
+---
+# Peer Registry Service - Manages peer registration, heartbeats, health scores
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: peer-registry
+  namespace: orchestrator
+  labels:
+    app: peer-registry
+    tier: service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: peer-registry
+  template:
+    metadata:
+      labels:
+        app: peer-registry
+        tier: service
+    spec:
+      serviceAccountName: peer-registry
+      containers:
+      - name: peer-registry
+        image: peer-registry:v1.0.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 50052
+          name: grpc
+          protocol: TCP
+        env:
+        - name: GRPC_PORT
+          value: "50052"
+        - name: HEARTBEAT_TIMEOUT_SECONDS
+          value: "900"
+        - name: INACTIVE_PEER_HOURS
+          value: "168"
+        - name: CHURN_THRESHOLD_HOURS
+          value: "720"
+        - name: MIN_HEALTH_SCORE
+          value: "70"
+        - name: LOG_LEVEL
+          value: "info"
+        envFrom:
+        - configMapRef:
+            name: orchestrator-config
+        - secretRef:
+            name: database-credentials
+        - secretRef:
+            name: redis-password
+        resources:
+          requests:
+            cpu: 300m
+            memory: 512Mi
+          limits:
+            cpu: 600m
+            memory: 1Gi
+        livenessProbe:
+          exec:
+            command: ["/bin/sh", "-c", "nc -z localhost 50052 || exit 1"]
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command: ["/bin/sh", "-c", "nc -z localhost 50052 || exit 1"]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: peer-registry
+  namespace: orchestrator
+  labels:
+    app: peer-registry
+spec:
+  type: ClusterIP
+  selector:
+    app: peer-registry
+  ports:
+  - port: 50052
+    targetPort: 50052
+    protocol: TCP
+    name: grpc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: peer-registry-pdb
+  namespace: orchestrator
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: peer-registry
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: peer-registry-hpa
+  namespace: orchestrator
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: peer-registry
+  minReplicas: 3
+  maxReplicas: 15
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70

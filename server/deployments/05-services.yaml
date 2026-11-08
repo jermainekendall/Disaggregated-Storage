@@ -1,0 +1,475 @@
+# Services YAML for Android Device Testing
+# File: 05-services-android.yaml
+# Exposes: API Gateway (primary) + Peer Registry (for peer devices)
+
+---
+# API Gateway - Main entry point for Android app (EXPOSED)
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: orchestrator
+  labels:
+    app: api-gateway
+spec:
+  type: NodePort
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 30080  # Android devices connect here
+    protocol: TCP
+    name: http
+  selector:
+    app: api-gateway
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: api-gateway
+        image: localhost:5000/api-gateway:v1.0.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DB_HOST
+          value: "cockroachdb-public"
+        - name: DB_PORT
+          value: "26257"
+        - name: DB_NAME
+          value: "orchestrator"
+        - name: DB_USER
+          value: "root"
+        - name: DB_PASSWORD
+          value: ""
+        - name: HTTP_PORT
+          value: "8080"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# Peer Registry - For Android devices to register as peers (EXPOSED)
+apiVersion: v1
+kind: Service
+metadata:
+  name: peer-registry
+  namespace: orchestrator
+spec:
+  type: NodePort
+  ports:
+  - port: 50051
+    targetPort: 50051
+    nodePort: 30051  # Android devices register here via gRPC
+    name: grpc
+  selector:
+    app: peer-registry
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: peer-registry
+  namespace: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: peer-registry
+  template:
+    metadata:
+      labels:
+        app: peer-registry
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: peer-registry
+        image: localhost:5000/peer-registry:v1.0.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 50051
+        env:
+        - name: DB_HOST
+          value: "cockroachdb-public"
+        - name: DB_PORT
+          value: "26257"
+        - name: DB_NAME
+          value: "orchestrator"
+        - name: DB_USER
+          value: "root"
+        - name: GRPC_PORT
+          value: "50051"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# Placement Service - Internal only (ClusterIP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: placement-service
+  namespace: orchestrator
+spec:
+  type: ClusterIP
+  ports:
+  - port: 50052
+    targetPort: 50052
+    name: grpc
+  selector:
+    app: placement-service
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: placement-service
+  namespace: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: placement-service
+  template:
+    metadata:
+      labels:
+        app: placement-service
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: placement-service
+        image: localhost:5000/placement-service:v1.0.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 50052
+        env:
+        - name: DB_HOST
+          value: "cockroachdb-public"
+        - name: DB_PORT
+          value: "26257"
+        - name: DB_NAME
+          value: "orchestrator"
+        - name: DB_USER
+          value: "root"
+        - name: GRPC_PORT
+          value: "50052"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# Billing Service - Internal only
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-service
+  namespace: orchestrator
+spec:
+  type: ClusterIP
+  ports:
+  - port: 50053
+    targetPort: 50053
+    name: grpc
+  selector:
+    app: billing-service
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-service
+  namespace: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: billing-service
+  template:
+    metadata:
+      labels:
+        app: billing-service
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: billing-service
+        image: localhost:5000/billing-service:v1.0.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 50053
+        env:
+        - name: DB_HOST
+          value: "cockroachdb-public"
+        - name: DB_PORT
+          value: "26257"
+        - name: DB_NAME
+          value: "orchestrator"
+        - name: DB_USER
+          value: "root"
+        - name: GRPC_PORT
+          value: "50053"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# Audit Service - Internal only
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit-service
+  namespace: orchestrator
+spec:
+  type: ClusterIP
+  ports:
+  - port: 50054
+    targetPort: 50054
+    name: grpc
+  selector:
+    app: audit-service
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-service
+  namespace: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: audit-service
+  template:
+    metadata:
+      labels:
+        app: audit-service
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: audit-service
+        image: localhost:5000/audit-service:v1.0.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 50054
+        env:
+        - name: DB_HOST
+          value: "cockroachdb-public"
+        - name: DB_PORT
+          value: "26257"
+        - name: DB_NAME
+          value: "orchestrator"
+        - name: DB_USER
+          value: "root"
+        - name: GRPC_PORT
+          value: "50054"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# Key Metadata Service - Internal only
+apiVersion: v1
+kind: Service
+metadata:
+  name: key-metadata
+  namespace: orchestrator
+spec:
+  type: ClusterIP
+  ports:
+  - port: 50055
+    targetPort: 50055
+    name: grpc
+  selector:
+    app: key-metadata
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: key-metadata
+  namespace: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: key-metadata
+  template:
+    metadata:
+      labels:
+        app: key-metadata
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: key-metadata
+        image: localhost:5000/key-metadata:v1.0.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 50055
+        env:
+        - name: DB_HOST
+          value: "cockroachdb-public"
+        - name: DB_PORT
+          value: "26257"
+        - name: DB_NAME
+          value: "orchestrator"
+        - name: DB_USER
+          value: "root"
+        - name: GRPC_PORT
+          value: "50055"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# Replication Worker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: replication-worker
+  namespace: orchestrator
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: replication-worker
+  template:
+    metadata:
+      labels:
+        app: replication-worker
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: replication-worker
+        image: localhost:5000/replication-worker:v1.0.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DB_HOST
+          value: "cockroachdb-public"
+        - name: DB_PORT
+          value: "26257"
+        - name: DB_NAME
+          value: "orchestrator"
+        - name: DB_USER
+          value: "root"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# Repair Worker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: repair-worker
+  namespace: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: repair-worker
+  template:
+    metadata:
+      labels:
+        app: repair-worker
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: repair-worker
+        image: localhost:5000/repair-worker:v1.0.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DB_HOST
+          value: "cockroachdb-public"
+        - name: DB_PORT
+          value: "26257"
+        - name: DB_NAME
+          value: "orchestrator"
+        - name: DB_USER
+          value: "root"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# Analytics Worker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-worker
+  namespace: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: analytics-worker
+  template:
+    metadata:
+      labels:
+        app: analytics-worker
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: analytics-worker
+        image: localhost:5000/analytics-worker:v1.0.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DB_HOST
+          value: "cockroachdb-public"
+        - name: DB_PORT
+          value: "26257"
+        - name: DB_NAME
+          value: "orchestrator"
+        - name: DB_USER
+          value: "root"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"

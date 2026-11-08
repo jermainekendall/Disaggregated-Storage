@@ -1,0 +1,65 @@
+---
+# Analytics Worker - ML predictions, usage analytics
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-worker
+  namespace: orchestrator
+  labels:
+    app: analytics-worker
+    tier: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: analytics-worker
+  template:
+    metadata:
+      labels:
+        app: analytics-worker
+        tier: worker
+    spec:
+      serviceAccountName: analytics-worker
+      containers:
+      - name: analytics-worker
+        image: analytics-worker:v1.0.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: WORKER_TYPE
+          value: "analytics"
+        - name: POLL_INTERVAL_SECONDS
+          value: "600"
+        - name: BATCH_SIZE
+          value: "1000"
+        - name: ML_MODEL_PATH
+          value: "/models/churn-prediction.pkl"
+        - name: PREDICTION_THRESHOLD
+          value: "0.7"
+        - name: LOG_LEVEL
+          value: "info"
+        envFrom:
+        - configMapRef:
+            name: orchestrator-config
+        - secretRef:
+            name: database-credentials
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+        livenessProbe:
+          exec:
+            command: ["/bin/sh", "-c", "ps aux | grep analytics-worker | grep -v grep"]
+          initialDelaySeconds: 30
+          periodSeconds: 60
+        volumeMounts:
+        - name: ml-models
+          mountPath: /models
+          readOnly: true
+      volumes:
+      - name: ml-models
+        configMap:
+          name: ml-models
+          optional: true

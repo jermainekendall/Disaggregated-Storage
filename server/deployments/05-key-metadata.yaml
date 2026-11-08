@@ -1,0 +1,125 @@
+---
+# Key Metadata Service - Manages file encryption keys (zero-knowledge)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: key-metadata
+  namespace: orchestrator
+  labels:
+    app: key-metadata
+    tier: service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: key-metadata
+  template:
+    metadata:
+      labels:
+        app: key-metadata
+        tier: service
+    spec:
+      serviceAccountName: key-metadata
+      containers:
+      - name: key-metadata
+        image: key-metadata:v1.0.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 50054
+          name: grpc
+          protocol: TCP
+        env:
+        - name: GRPC_PORT
+          value: "50054"
+        - name: KEY_ROTATION_DAYS
+          value: "365"
+        - name: RECOVERY_THRESHOLD
+          value: "3"
+        - name: RECOVERY_TOTAL_SHARES
+          value: "5"
+        - name: LOG_LEVEL
+          value: "info"
+        envFrom:
+        - configMapRef:
+            name: orchestrator-config
+        - secretRef:
+            name: database-credentials
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 400m
+            memory: 512Mi
+        livenessProbe:
+          exec:
+            command: ["/bin/sh", "-c", "nc -z localhost 50054 || exit 1"]
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command: ["/bin/sh", "-c", "nc -z localhost 50054 || exit 1"]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        # Security: Read-only root filesystem
+        securityContext:
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: key-metadata
+  namespace: orchestrator
+  labels:
+    app: key-metadata
+spec:
+  type: ClusterIP
+  selector:
+    app: key-metadata
+  ports:
+  - port: 50054
+    targetPort: 50054
+    protocol: TCP
+    name: grpc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: key-metadata-pdb
+  namespace: orchestrator
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: key-metadata
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: key-metadata-hpa
+  namespace: orchestrator
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: key-metadata
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70

@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package peer;
+option go_package = "github.com/jermainekendall/disaggregated-storage/server/proto/peer";
+
+// PeerRegistry tracks storage peers: registration, liveness and lookup.
+//
+// Field numbers 1-12 are unchanged from the original contract so existing
+// clients keep working. New fields are appended.
+service PeerRegistry {
+  rpc RegisterPeer(PeerRegistration) returns (RegistrationResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc GetPeer(PeerRequest) returns (PeerInfo);
+  rpc ListPeers(ListPeersRequest) returns (PeerList);
+}
+
+message PeerRegistration {
+  // Server-assigned peer UUID. Leave empty on first registration; the server
+  // then keys the peer on libp2p_peer_id and returns the UUID to reuse.
+  string peer_id = 1;
+
+  string libp2p_peer_id = 2;
+  string multiaddr = 3;
+  repeated string multiaddrs = 4;
+
+  // Legacy fields, accepted and ignored.
+  string ip_address = 5;
+  int32 port = 6;
+
+  int64 total_capacity_bytes = 7;
+  int64 available_capacity_bytes = 8;
+
+  string region = 9;
+  string asn = 10;
+  string timezone = 11; // IANA name, e.g. "America/Guyana"
+
+  string version = 12;
+
+  // Optional owning user (UUID). Peers may register before an account is linked.
+  string user_id = 13;
+  string device_model = 14;
+  string os_type = 15;
+}
+
+message RegistrationResponse {
+  bool success = 1;
+  string message = 2;
+  string peer_id = 3;
+}
+
+message HeartbeatRequest {
+  // Either the server-assigned UUID or the libp2p peer ID.
+  string peer_id = 1;
+  int64 available_capacity_bytes = 2;
+  // Current addresses. Leave empty to keep the stored ones.
+  repeated string multiaddrs = 3;
+  double cpu_usage = 4;
+  double memory_usage = 5;
+  bool is_charging = 6;
+  int32 battery_level = 7; // 0-100, or -1 if unknown
+  string network_type = 8;
+}
+
+message HeartbeatResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message PeerRequest {
+  // Either the server-assigned UUID or the libp2p peer ID.
+  string peer_id = 1;
+}
+
+message PeerInfo {
+  string peer_id = 1;
+  string libp2p_peer_id = 2;
+  string multiaddr = 3;
+  repeated string multiaddrs = 4;
+  string ip_address = 5; // legacy, always empty
+  int32 port = 6;        // legacy, always 0
+  int64 total_capacity_bytes = 7;
+  int64 available_capacity_bytes = 8;
+  string region = 9;
+  string asn = 10;
+  string status = 11; // "active" or "inactive"
+  double health_score = 12;
+  int64 last_heartbeat = 13; // unix seconds
+  string timezone = 14;
+  string user_id = 15;
+}
+
+message ListPeersRequest {
+  int32 limit = 1;   // default 100, max 1000
+  string status = 2; // "active", "inactive", "all" (default)
+  // Only return peers at or above this health score. 0 means no filter.
+  double min_health_score = 3;
+  int32 offset = 4;
+}
+
+message PeerList {
+  repeated PeerInfo peers = 1;
+  // Number of peers matching the filter, not just this page.
+  int32 total_count = 2;
+}

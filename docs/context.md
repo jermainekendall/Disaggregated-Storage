@@ -26,30 +26,29 @@ whole file.
 - **Security (design):** AES-256-GCM key per file, a master key and recovery secret,
   Shamir secret sharing for key escrow, and libp2p Noise encryption between peers.
 
-## Current state
+## Current state (2026-11-08)
 
-- The source tree the reference describes (`production-complete/`, `server-updates/`,
-  `outputs/relay-service/`, `orchestrator-k8s/`, `peer-registry-FIXED/`) is **not yet in
-  this repository**. Only these docs and the README are here.
-- No server component builds today. The three blockers:
-  1. Three protobuf sources disagree. Pick one (recommended:
-     `server-updates/proto/peer_registry.proto`) and regenerate the stubs with `protoc`.
-  2. `peer-registry/main.go` does not compile against the proto types.
-  3. `getEnvInt` and `getEnvFloat` in the peer registry ignore the environment.
-- Other open gaps: the port mapping (50051 vs 50052), timezone stored both as text and as
-  an int, migration 001 writing placeholder multiaddrs that can't be dialed, no
-  `shard_locations` table, no TLS on the gateway or database, a global rather than
-  per-client rate limit, the relay image needing a rebuild at v1.0.1, and workers that
-  haven't been reviewed. The full table is in §12 of the reference.
+The server code is in `server/` (see `server/README.md`). A review of the uploaded code
+found it compiled but could not work end to end: the code and schema disagreed, most
+gRPC services were never registered, repair treated erasure-coded shards as 14 copies
+each, the relay cut circuits at 1 MiB, and `install.sh` stopped before deploying. Those
+issues were fixed on the `development` branch:
 
-## Next steps (from the reference, §13)
+- One Go module, one Dockerfile, one set of protos, one idempotent `schema.sql` that
+  also upgrades the old schema in place.
+- Canonical ports: peer-registry 50051, placement 50052, billing 50053, audit 50054,
+  key-metadata 50055, gateway 8080 (NodePort 30080), relay 4001 (NodePort 30001).
+- Timezone is stored as an IANA name everywhere. The `shards` table is the placement
+  table (one row per shard copy on a peer).
+- Audits use precomputed proof-of-storage challenges. Repair rebuilds each missing
+  shard index once on one new peer. Tiering uses a 30-day access window.
+- The relay has a persistent identity from a Secret and no circuit data limit.
+- An end-to-end test runs every flow against a real CockroachDB.
 
-1. Choose the canonical proto, regenerate the stubs, and align the Go code with the
-   generated names.
-2. Fix the env getters, then run `go build ./...` in each service directory.
-3. Resolve the port mapping and timezone representation, and update the manifests.
-4. Correct migration 001 so placeholder addresses are never dialed.
-5. Build each service and run a gRPC smoke test before deploying.
+Still out of scope for the test deployment: TLS, authentication of peer agents,
+real payment processing, health-score formulas, AS-path awareness and timezone
+clustering in placement, and a peer agent implementation (the server endpoints it
+needs exist).
 
 ## Related work
 

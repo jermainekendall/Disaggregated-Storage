@@ -1,5 +1,6 @@
----
-# API Gateway - REST/GraphQL entry point for all client requests
+# api-gateway
+# Test deployment: one replica. Background jobs are safe to scale (they claim
+# work atomically), but one pod per service is plenty for a test cluster.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,9 +8,9 @@ metadata:
   namespace: orchestrator
   labels:
     app: api-gateway
-    tier: gateway
+    tier: service
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       app: api-gateway
@@ -17,73 +18,50 @@ spec:
     metadata:
       labels:
         app: api-gateway
-        tier: gateway
+        tier: service
     spec:
-      serviceAccountName: api-gateway
+      serviceAccountName: api-gateway-sa
       containers:
       - name: api-gateway
-        image: api-gateway:v1.0.0
-        imagePullPolicy: IfNotPresent
+        image: orchestrator/api-gateway:dev
+        imagePullPolicy: Never   # install.sh imports the image into containerd
         ports:
         - containerPort: 8080
           name: http
-          protocol: TCP
-        - containerPort: 8443
-          name: https
-          protocol: TCP
-        env:
-        - name: PORT
-          value: "8080"
-        - name: HTTPS_PORT
-          value: "8443"
-        - name: ENVIRONMENT
-          value: "production"
-        - name: LOG_LEVEL
-          value: "info"
-        - name: CORS_ALLOWED_ORIGINS
-          value: "*"
-        - name: RATE_LIMIT_REQUESTS_PER_MINUTE
-          value: "1000"
-        - name: JWT_EXPIRY_MINUTES
-          value: "60"
         envFrom:
         - configMapRef:
             name: orchestrator-config
         - secretRef:
-            name: jwt-secret
-        - secretRef:
-            name: database-credentials
+            name: gateway-secrets   # JWT_SECRET
+        env:
+        - name: SERVICE_NAME
+          value: "api-gateway"
+        - name: RATE_LIMIT_REQUESTS_PER_MINUTE
+          value: "600"
+        - name: JWT_EXPIRY_MINUTES
+          value: "60"
+        - name: CORS_ALLOWED_ORIGINS
+          value: "*"
         resources:
           requests:
-            cpu: 500m
-            memory: 512Mi
+            cpu: 50m
+            memory: 64Mi
           limits:
-            cpu: 1000m
-            memory: 1Gi
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8080
-          initialDelaySeconds: 15
-          periodSeconds: 30
-          timeoutSeconds: 5
+            cpu: 500m
+            memory: 256Mi
         readinessProbe:
           httpGet:
             path: /ready
             port: 8080
-          initialDelaySeconds: 10
           periodSeconds: 10
-          timeoutSeconds: 3
-        volumeMounts:
-        - name: tls-certs
-          mountPath: /etc/tls
-          readOnly: true
-      volumes:
-      - name: tls-certs
-        secret:
-          secretName: api-gateway-tls
-          optional: true
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 20
 ---
+# Clients and peer agents reach the gateway on <node-ip>:30080.
 apiVersion: v1
 kind: Service
 metadata:
@@ -92,52 +70,11 @@ metadata:
   labels:
     app: api-gateway
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app: api-gateway
   ports:
-  - port: 8080
+  - name: http
+    port: 8080
     targetPort: 8080
-    protocol: TCP
-    name: http
-  - port: 8443
-    targetPort: 8443
-    protocol: TCP
-    name: https
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: api-gateway-pdb
-  namespace: orchestrator
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      app: api-gateway
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: api-gateway-hpa
-  namespace: orchestrator
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: api-gateway
-  minReplicas: 3
-  maxReplicas: 20
-  metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 70
-  - type: Resource
-    resource:
-      name: memory
-      target:
-        type: Utilization
-        averageUtilization: 80
+    nodePort: 30080

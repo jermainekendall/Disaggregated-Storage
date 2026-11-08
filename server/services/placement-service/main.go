@@ -1,211 +1,134 @@
-// Placement Service - Complete Fresh Implementation
-// File: main.go
-
+// Placement Service: decides the erasure code for a new file and which peers
+// hold its shards.
 package main
 
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log"
-	"math/rand"
-	"net"
-	"os"
-	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
-	
-	pb "github.com/orchestrator/placement-service/proto/placement"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/jermainekendall/disaggregated-storage/server/internal/common"
+	pb "github.com/jermainekendall/disaggregated-storage/server/proto/placement"
 )
 
-// Configuration
-const (
-	MinShardCount       = 10
-	MaxShardCount       = 100
-	MaxShardSizeGB      = 5.0
-	DefaultParityShards = 4
-)
-
-type Config struct {
-	DBHost     string
-	DBPort     string
-	DBName     string
-	DBUser     string
-	DBPassword string
-	GRPCPort   string
+var requiredSchema = map[string][]string{
+	"peers": {"peer_id", "libp2p_peer_id", "multiaddr", "multiaddrs", "asn", "region", "timezone",
+		"storage_free_gb", "health_score", "is_online"},
 }
 
-func loadConfig() *Config {
-	return &Config{
-		DBHost:     getEnv("DB_HOST", "cockroachdb-public"),
-		DBPort:     getEnv("DB_PORT", "26257"),
-		DBName:     getEnv("DB_NAME", "orchestrator"),
-		DBUser:     getEnv("DB_USER", "root"),
-		DBPassword: getEnv("DB_PASSWORD", ""),
-		GRPCPort:   getEnv("GRPC_PORT", "50052"),
-	}
-}
-
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-type Peer struct {
-	PeerID        string
-	ASN           string
-	Region        string
-	StorageFreeGB float64
-	HealthScore   float64
-	Timezone      int
-}
-
-type PlacementServer struct {
+type server struct {
 	pb.UnimplementedPlacementServiceServer
-	db     *sql.DB
-	config *Config
+	db  *sql.DB
+	cfg Config
 }
 
-// SelectPeersForUpload selects optimal peers for file storage
-func (s *PlacementServer) SelectPeersForUpload(ctx context.Context, req *pb.UploadRequest) (*pb.PeerSelection, error) {
-	log.Printf("SelectPeersForUpload called for file: %s, size: %d bytes", req.FileId, req.FileSizeBytes)
-
-	// Calculate shard strategy
-	fileSizeGB := float64(req.FileSizeBytes) / 1073741824.0
-	shardCount := MinShardCount
-	
-	// Increase shard count for large files
-	for fileSizeGB/float64(shardCount) > MaxShardSizeGB && shardCount < MaxShardCount {
-		shardCount *= 2
+func loadConfig() Config {
+	return Config{
+		MinShardCount:    common.EnvInt("MIN_SHARD_COUNT", 10),
+		MaxShardCount:    common.EnvInt("MAX_SHARD_COUNT", 100),
+		MaxShardSizeGB:   common.EnvFloat("MAX_SHARD_SIZE_GB", 5),
+		ParityShards:     common.EnvInt("PARITY_SHARDS", 4),
+		MinHealthScore:   common.EnvFloat("MIN_HEALTH_SCORE", 70),
+		MaxPeersPerASN:   common.EnvInt("MAX_PEERS_PER_ASN", 3),
+		MinASNsPerFile:   common.EnvInt("MIN_ASNS_PER_FILE", 5),
+		CapacityHeadroom: common.EnvFloat("CAPACITY_HEADROOM", 1.2),
 	}
-	if shardCount > MaxShardCount {
-		shardCount = MaxShardCount
+}
+
+// SelectPeersForUpload picks one peer per shard for a new file.
+func (s *server) SelectPeersForUpload(ctx context.Context, req *pb.UploadRequest) (*pb.PeerSelection, error) {
+	if req.FileSizeBytes <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "file_size_bytes must be positive")
 	}
-
-	totalShards := shardCount + DefaultParityShards
-
-	log.Printf("Adaptive sharding: %d data + %d parity = %d total shards", 
-		shardCount, DefaultParityShards, totalShards)
-
-	// Get candidate peers
-	peers, err := s.getCandidatePeers(ctx, totalShards*2)
+	candidates, err := s.loadCandidates(ctx, req.OwnerPeerId)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get peers: %v", err)
+		return nil, status.Errorf(codes.Internal, "load peers: %v", err)
 	}
 
-	if len(peers) < totalShards {
-		return nil, fmt.Errorf("insufficient peers: need %d, have %d", totalShards, len(peers))
+	plan, err := Plan(s.cfg, req.FileSizeBytes, candidates, nil)
+	if err != nil {
+		log.Printf("placement for file %s (%d bytes) failed: %v", req.FileId, req.FileSizeBytes, err)
+		return nil, err
 	}
 
-	// Select best peers (top N by health score)
-	selectedPeers := peers[:totalShards]
-
-	// Build response
-	response := &pb.PeerSelection{
-		FileId:       req.FileId,
-		ShardCount:   int32(shardCount),
-		ParityShards: int32(DefaultParityShards),
-		Peers:        make([]*pb.SelectedPeer, totalShards),
+	resp := &pb.PeerSelection{
+		FileId:         req.FileId,
+		ShardCount:     int32(plan.DataShards),
+		ParityShards:   int32(plan.ParityShards),
+		ShardSizeBytes: plan.ShardSizeBytes,
 	}
-
-	for i, peer := range selectedPeers {
+	for i, p := range plan.Peers {
 		shardType := "data"
-		if i >= shardCount {
+		if i >= plan.DataShards {
 			shardType = "parity"
 		}
-
-		response.Peers[i] = &pb.SelectedPeer{
-			PeerId:      peer.PeerID,
-			ShardIndex:  int32(i),
-			ShardType:   shardType,
-			PeerAddress: fmt.Sprintf("peer-%s:9000", peer.PeerID),
-			HealthScore: peer.HealthScore,
-			Asn:         peer.ASN,
-			Region:      peer.Region,
-		}
+		resp.Peers = append(resp.Peers, &pb.SelectedPeer{
+			PeerId:       p.PeerID,
+			ShardIndex:   int32(i),
+			ShardType:    shardType,
+			PeerAddress:  p.Multiaddr,
+			HealthScore:  p.HealthScore,
+			Asn:          p.ASN,
+			Region:       p.Region,
+			Libp2PPeerId: p.Libp2pID,
+			Multiaddrs:   p.Multiaddrs,
+			Timezone:     p.Timezone,
+		})
 	}
-
-	log.Printf("Selected %d peers for file %s", len(selectedPeers), req.FileId)
-	return response, nil
+	log.Printf("file %s: %d data + %d parity shards of %d bytes on %d peers across %d ASNs",
+		req.FileId, plan.DataShards, plan.ParityShards, plan.ShardSizeBytes, len(plan.Peers), plan.DistinctASNs)
+	return resp, nil
 }
 
-// getCandidatePeers retrieves peers from database
-func (s *PlacementServer) getCandidatePeers(ctx context.Context, count int) ([]*Peer, error) {
-	query := `
-		SELECT peer_id, asn, region, storage_free_gb, health_score, timezone
+// loadCandidates returns online, healthy, dialable peers other than the owner.
+// Capacity is filtered in Plan, because the shard size depends on how many
+// peers are available.
+func (s *server) loadCandidates(ctx context.Context, owner string) ([]Candidate, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT peer_id, COALESCE(libp2p_peer_id, ''), multiaddr, multiaddrs, asn, region, timezone,
+		       storage_free_gb, health_score
 		FROM peers
-		WHERE is_online = true AND health_score > 70
-		ORDER BY health_score DESC, RANDOM()
-		LIMIT $1
-	`
-
-	rows, err := s.db.QueryContext(ctx, query, count)
+		WHERE is_online = true
+		  AND health_score >= $1
+		  AND multiaddr IS NOT NULL
+		  AND peer_id::STRING != $2
+		  AND COALESCE(libp2p_peer_id, '') != $2
+		LIMIT 5000`, s.cfg.MinHealthScore, owner)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var peers []*Peer
+	var out []Candidate
 	for rows.Next() {
-		peer := &Peer{}
-		err := rows.Scan(&peer.PeerID, &peer.ASN, &peer.Region,
-			&peer.StorageFreeGB, &peer.HealthScore, &peer.Timezone)
-		if err != nil {
-			continue
+		var c Candidate
+		if err := rows.Scan(&c.PeerID, &c.Libp2pID, &c.Multiaddr, pq.Array(&c.Multiaddrs), &c.ASN,
+			&c.Region, &c.Timezone, &c.FreeGB, &c.HealthScore); err != nil {
+			return nil, err
 		}
-		peers = append(peers, peer)
+		out = append(out, c)
 	}
-
-	return peers, nil
+	return out, rows.Err()
 }
 
 func main() {
-	log.Println("Starting Placement Service...")
+	ctx, stop := common.SignalContext()
+	defer stop()
 
-	config := loadConfig()
-
-	// Connect to database
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		config.DBHost, config.DBPort, config.DBUser, config.DBPassword, config.DBName)
-
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+	cfg := loadConfig()
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("placement config: %v", err)
 	}
+	db := common.MustOpenDB(ctx, requiredSchema)
 	defer db.Close()
 
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
-	}
-
-	log.Println("Connected to database successfully")
-
-	// Create server
-	server := &PlacementServer{
-		db:     db,
-		config: config,
-	}
-
-	// Seed random
-	rand.Seed(time.Now().UnixNano())
-
-	// Create gRPC server
-	lis, err := net.Listen("tcp", ":"+config.GRPCPort)
-	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
-	}
-
-	grpcServer := grpc.NewServer()
-	pb.RegisterPlacementServiceServer(grpcServer, server)
-	reflection.Register(grpcServer)
-
-	log.Printf("Placement Service listening on port %s", config.GRPCPort)
-
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
-	}
+	s := &server{db: db, cfg: cfg}
+	common.ServeGRPC(ctx, "placement-service", common.Env("GRPC_PORT", "50052"), func(g *grpc.Server) {
+		pb.RegisterPlacementServiceServer(g, s)
+	})
 }

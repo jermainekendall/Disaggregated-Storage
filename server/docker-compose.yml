@@ -1,0 +1,140 @@
+# Local stack without Kubernetes: CockroachDB, the schema, every service and
+# the relay. From server/:
+#
+#   docker compose up --build
+#
+# Gateway: http://localhost:8080   Peer registry (gRPC): localhost:50051
+# Relay: /ip4/127.0.0.1/tcp/4001 (random identity; fine for local runs)
+# CockroachDB console: http://localhost:8081
+x-service: &service
+  restart: unless-stopped
+  depends_on:
+    schema:
+      condition: service_completed_successfully
+  environment: &env
+    DB_HOST: cockroachdb
+    DB_PORT: "26257"
+    DB_NAME: orchestrator
+    DB_USER: root
+    DB_SSLMODE: disable
+
+services:
+  cockroachdb:
+    image: cockroachdb/cockroach:v23.1.13
+    command: start-single-node --insecure
+    ports: ["26257:26257", "8081:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/health?ready=1"]
+      interval: 3s
+      retries: 40
+
+  schema:
+    image: cockroachdb/cockroach:v23.1.13
+    depends_on:
+      cockroachdb:
+        condition: service_healthy
+    volumes: ["./infrastructure/schema.sql:/schema.sql:ro"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        ./cockroach sql --insecure --host=cockroachdb -e "CREATE DATABASE IF NOT EXISTS orchestrator" &&
+        ./cockroach sql --insecure --host=cockroachdb --database=orchestrator < /schema.sql > /dev/null
+
+  api-gateway:
+    <<: *service
+    image: orchestrator/api-gateway:dev
+    build: {context: ., args: {SERVICE: api-gateway}}
+    ports: ["8080:8080"]
+    environment:
+      <<: *env
+      SERVICE_NAME: api-gateway
+      JWT_SECRET: local-dev-secret
+      PEER_REGISTRY_ADDR: peer-registry:50051
+      PLACEMENT_ADDR: placement-service:50052
+      BILLING_ADDR: billing-service:50053
+
+  peer-registry:
+    <<: *service
+    image: orchestrator/peer-registry:dev
+    build: {context: ., args: {SERVICE: peer-registry}}
+    ports: ["50051:50051"]
+    environment:
+      <<: *env
+      SERVICE_NAME: peer-registry
+      GRPC_PORT: "50051"
+
+  placement-service:
+    <<: *service
+    image: orchestrator/placement-service:dev
+    build: {context: ., args: {SERVICE: placement-service}}
+    ports: ["50052:50052"]
+    environment:
+      <<: *env
+      SERVICE_NAME: placement-service
+      GRPC_PORT: "50052"
+      MIN_SHARD_COUNT: "4"
+      PARITY_SHARDS: "2"
+      MAX_PEERS_PER_ASN: "0"
+      MIN_ASNS_PER_FILE: "1"
+
+  billing-service:
+    <<: *service
+    image: orchestrator/billing-service:dev
+    build: {context: ., args: {SERVICE: billing-service}}
+    ports: ["50053:50053"]
+    environment:
+      <<: *env
+      SERVICE_NAME: billing-service
+      GRPC_PORT: "50053"
+
+  audit-service:
+    <<: *service
+    image: orchestrator/audit-service:dev
+    build: {context: ., args: {SERVICE: audit-service}}
+    ports: ["50054:50054"]
+    environment:
+      <<: *env
+      SERVICE_NAME: audit-service
+      GRPC_PORT: "50054"
+
+  key-metadata:
+    <<: *service
+    image: orchestrator/key-metadata:dev
+    build: {context: ., args: {SERVICE: key-metadata}}
+    ports: ["50055:50055"]
+    environment:
+      <<: *env
+      SERVICE_NAME: key-metadata
+      GRPC_PORT: "50055"
+
+  repair-worker:
+    <<: *service
+    image: orchestrator/repair-worker:dev
+    build: {context: ., args: {SERVICE: repair-worker}}
+    environment:
+      <<: *env
+      SERVICE_NAME: repair-worker
+
+  replication-worker:
+    <<: *service
+    image: orchestrator/replication-worker:dev
+    build: {context: ., args: {SERVICE: replication-worker}}
+    environment:
+      <<: *env
+      SERVICE_NAME: replication-worker
+
+  analytics-worker:
+    <<: *service
+    image: orchestrator/analytics-worker:dev
+    build: {context: ., args: {SERVICE: analytics-worker}}
+    environment:
+      <<: *env
+      SERVICE_NAME: analytics-worker
+
+  relay-service:
+    image: orchestrator/relay-service:dev
+    build: {context: ., args: {SERVICE: relay-service}}
+    restart: unless-stopped
+    ports: ["4001:4001"]
+    environment:
+      PORT: "4001"

@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package placement;
+option go_package = "github.com/jermainekendall/disaggregated-storage/server/proto/placement";
+
+// PlacementService chooses which peers hold the shards of a new file.
+service PlacementService {
+  rpc SelectPeersForUpload(UploadRequest) returns (PeerSelection);
+}
+
+message UploadRequest {
+  string file_id = 1;
+  int64 file_size_bytes = 2;
+  // Peer of the uploading device; it is never chosen to hold a shard.
+  string owner_peer_id = 3;
+  string storage_tier = 4;
+}
+
+message PeerSelection {
+  string file_id = 1;
+  int32 shard_count = 2;   // data shards
+  int32 parity_shards = 3;
+  repeated SelectedPeer peers = 4; // one per shard, data shards first
+  int64 shard_size_bytes = 5;
+}
+
+message SelectedPeer {
+  string peer_id = 1;
+  int32 shard_index = 2;
+  string shard_type = 3; // "data" or "parity"
+  // Primary libp2p multiaddr to dial (may be a relay circuit address).
+  string peer_address = 4;
+  double health_score = 5;
+  string asn = 6;
+  string region = 7;
+  string libp2p_peer_id = 8;
+  repeated string multiaddrs = 9;
+  string timezone = 10;
+}

@@ -1,0 +1,75 @@
+# billing-service
+# Test deployment: one replica. Background jobs are safe to scale (they claim
+# work atomically), but one pod per service is plenty for a test cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-service
+  namespace: orchestrator
+  labels:
+    app: billing-service
+    tier: service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: billing-service
+  template:
+    metadata:
+      labels:
+        app: billing-service
+        tier: service
+    spec:
+      serviceAccountName: billing-service-sa
+      containers:
+      - name: billing-service
+        image: orchestrator/billing-service:dev
+        imagePullPolicy: Never   # install.sh imports the image into containerd
+        ports:
+        - containerPort: 50053
+          name: grpc
+        envFrom:
+        - configMapRef:
+            name: orchestrator-config
+        env:
+        - name: SERVICE_NAME
+          value: "billing-service"
+        - name: GRPC_PORT
+          value: "50053"
+        - name: BILLING_CHECK_INTERVAL
+          value: "1h"
+        # Test deployment: payouts are simulated, no money moves.
+        - name: SIMULATE_PAYMENTS
+          value: "true"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        readinessProbe:
+          grpc:
+            port: 50053
+          periodSeconds: 10
+        livenessProbe:
+          grpc:
+            port: 50053
+          initialDelaySeconds: 10
+          periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-service
+  namespace: orchestrator
+  labels:
+    app: billing-service
+spec:
+  type: ClusterIP
+  selector:
+    app: billing-service
+  ports:
+  - name: grpc
+    port: 50053
+    targetPort: 50053

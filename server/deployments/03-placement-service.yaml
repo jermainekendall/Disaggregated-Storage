@@ -1,0 +1,86 @@
+# placement-service
+# Test deployment: one replica. Background jobs are safe to scale (they claim
+# work atomically), but one pod per service is plenty for a test cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: placement-service
+  namespace: orchestrator
+  labels:
+    app: placement-service
+    tier: service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: placement-service
+  template:
+    metadata:
+      labels:
+        app: placement-service
+        tier: service
+    spec:
+      serviceAccountName: placement-service-sa
+      containers:
+      - name: placement-service
+        image: orchestrator/placement-service:dev
+        imagePullPolicy: Never   # install.sh imports the image into containerd
+        ports:
+        - containerPort: 50052
+          name: grpc
+        envFrom:
+        - configMapRef:
+            name: orchestrator-config
+        env:
+        - name: SERVICE_NAME
+          value: "placement-service"
+        - name: GRPC_PORT
+          value: "50052"
+        # Test-cluster code: 4 data + 2 parity, so 6 peers are enough. Production: 10 + 4.
+        - name: MIN_SHARD_COUNT
+          value: "4"
+        - name: PARITY_SHARDS
+          value: "2"
+        - name: MAX_SHARD_COUNT
+          value: "100"
+        - name: MAX_SHARD_SIZE_GB
+          value: "5"
+        # Test devices often share one home ISP, so ASN rules are off. Production: 3 / 5.
+        - name: MAX_PEERS_PER_ASN
+          value: "0"
+        - name: MIN_ASNS_PER_FILE
+          value: "1"
+        - name: CAPACITY_HEADROOM
+          value: "1.2"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        readinessProbe:
+          grpc:
+            port: 50052
+          periodSeconds: 10
+        livenessProbe:
+          grpc:
+            port: 50052
+          initialDelaySeconds: 10
+          periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: placement-service
+  namespace: orchestrator
+  labels:
+    app: placement-service
+spec:
+  type: ClusterIP
+  selector:
+    app: placement-service
+  ports:
+  - name: grpc
+    port: 50052
+    targetPort: 50052

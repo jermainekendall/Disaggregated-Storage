@@ -1,7 +1,4 @@
-// Peer Registry Service - Complete Implementation with libp2p Support
-// Manages peer registration, heartbeats, health scoring, and lifecycle
-// File: services/peer-registry/main.go
-
+// Peer Registry: peer registration, heartbeats, lookup and liveness.
 package main
 
 import (
@@ -9,457 +6,324 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"net"
-	"os"
+	"strings"
 	"time"
 
-	"github.com/lib/pq"  // ADDED for libp2p multiaddr arrays
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
-	
-	pb "github.com/orchestrator/peer-registry/proto/peer"
+
+	"github.com/jermainekendall/disaggregated-storage/server/internal/common"
+	pb "github.com/jermainekendall/disaggregated-storage/server/proto/peer"
 )
 
-// Configuration
-type Config struct {
-	DBHost               string
-	DBPort               string
-	DBName               string
-	DBUser               string
-	DBPassword           string
-	GRPCPort             string
-	HeartbeatTimeout     int // seconds
-	InactivePeerHours    int
-	ChurnThresholdHours  int
-	MinHealthScore       float64
+const gb = 1024 * 1024 * 1024
+
+type config struct {
+	GRPCPort         string
+	HeartbeatTimeout time.Duration
+	CheckInterval    time.Duration
 }
 
-func loadConfig() *Config {
-	return &Config{
-		DBHost:              getEnv("DB_HOST", "cockroachdb-public"),
-		DBPort:              getEnv("DB_PORT", "26257"),
-		DBName:              getEnv("DB_NAME", "orchestrator"),
-		DBUser:              getEnv("DB_USER", "root"),
-		DBPassword:          getEnv("DB_PASSWORD", ""),
-		GRPCPort:            getEnv("GRPC_PORT", "50052"),
-		HeartbeatTimeout:    getEnvInt("HEARTBEAT_TIMEOUT_SECONDS", 900),    // 15 min
-		InactivePeerHours:   getEnvInt("INACTIVE_PEER_HOURS", 168),          // 7 days
-		ChurnThresholdHours: getEnvInt("CHURN_THRESHOLD_HOURS", 720),        // 30 days
-		MinHealthScore:      getEnvFloat("MIN_HEALTH_SCORE", 70.0),
+func loadConfig() config {
+	return config{
+		GRPCPort:         common.Env("GRPC_PORT", "50051"),
+		HeartbeatTimeout: common.EnvDuration("HEARTBEAT_TIMEOUT_SECONDS", 15*time.Minute),
+		CheckInterval:    common.EnvDuration("INACTIVITY_CHECK_INTERVAL", time.Minute),
 	}
 }
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
+var requiredSchema = map[string][]string{
+	"peers": {"peer_id", "user_id", "libp2p_peer_id", "multiaddr", "multiaddrs", "asn", "timezone",
+		"region", "device_model", "os_type", "app_version", "storage_total_gb", "storage_free_gb",
+		"is_online", "is_charging", "battery_level", "network_type", "health_score",
+		"last_seen_at", "last_heartbeat_at", "updated_at"},
 }
 
-func getEnvInt(key string, defaultValue int) int {
-	// Simplified for brevity
-	return defaultValue
-}
-
-func getEnvFloat(key string, defaultValue float64) float64 {
-	// Simplified for brevity
-	return defaultValue
-}
-
-// Peer represents a storage node
-type Peer struct {
-	PeerID          string
-	UserID          string
-	LibP2PPeerID    string  // ADDED for libp2p
-	Multiaddr       string  // ADDED for libp2p
-	ASN             string
-	Timezone        string
-	Region          string
-	CountryCode     string
-	ISP             string
-	DeviceModel     string
-	OSType          string
-	OSVersion       string
-	StorageTotalGB  int
-	StorageFreeGB   float64
-	BandwidthMaxMbps int
-	IsOnline        bool
-	IsCharging      bool
-	BatteryLevel    int
-	NetworkType     string
-	HealthScore     float64
-	ReliabilityScore float64
-	UptimePercentage float64
-	TotalUploads    int
-	TotalDownloads  int
-	BytesServed     int64
-	FirstSeenAt     time.Time
-	LastSeenAt      time.Time
-	LastHeartbeatAt time.Time
-}
-
-// PeerRegistryServer implements the peer registry service
-type PeerRegistryServer struct {
+type server struct {
 	pb.UnimplementedPeerRegistryServer
-	db     *sql.DB
-	config *Config
+	db  *sql.DB
+	cfg config
 }
 
-// RegisterPeer registers a new peer or updates existing one (UPDATED FOR LIBP2P)
-func (s *PeerRegistryServer) RegisterPeer(ctx context.Context, req *pb.PeerRegistration) (*pb.RegistrationResponse, error) {
-	log.Printf("RegisterPeer called for peer: %s (libp2p: %s)", req.PeerId, req.Libp2PPeerId)
+// idColumn picks the column to match a caller-supplied peer identifier
+// against: server UUIDs match peer_id, anything else is a libp2p peer ID.
+// Comparing a non-UUID string with the UUID column would be a type error.
+func idColumn(id string) string {
+	if common.IsUUID(id) {
+		return "peer_id"
+	}
+	return "libp2p_peer_id"
+}
 
-	// Validate required fields
-	if req.PeerId == "" {
-		return &pb.RegistrationResponse{
-			Success: false,
-			Message: "peer_id is required",
-		}, nil
+// RegisterPeer creates a peer or updates an existing one. New peers usually
+// send only libp2p_peer_id; the server assigns peer_id and returns it.
+func (s *server) RegisterPeer(ctx context.Context, req *pb.PeerRegistration) (*pb.RegistrationResponse, error) {
+	fail := func(msg string) (*pb.RegistrationResponse, error) {
+		log.Printf("RegisterPeer rejected (peer_id=%q libp2p=%q): %s", req.PeerId, req.Libp2PPeerId, msg)
+		return &pb.RegistrationResponse{Success: false, Message: msg}, nil
 	}
 
-	var peerID string
-	now := time.Now()
-
-	// Convert bytes to GB
-	totalGB := int(req.TotalCapacityBytes / (1024 * 1024 * 1024))
-	freeGB := float64(req.AvailableCapacityBytes) / (1024 * 1024 * 1024)
-	
-	// Get timezone (use provided or default to UTC)
-	timezone := req.Timezone
-	if timezone == "" {
-		timezone = "UTC"
+	req.PeerId = strings.TrimSpace(req.PeerId)
+	req.Libp2PPeerId = strings.TrimSpace(req.Libp2PPeerId)
+	switch {
+	case req.PeerId == "" && req.Libp2PPeerId == "":
+		return fail("peer_id or libp2p_peer_id is required")
+	case req.PeerId != "" && !common.IsUUID(req.PeerId):
+		return fail("peer_id must be the UUID returned by a previous registration; send a libp2p ID in libp2p_peer_id")
+	case req.UserId != "" && !common.IsUUID(req.UserId):
+		return fail("user_id must be a UUID")
+	case req.TotalCapacityBytes < 0 || req.AvailableCapacityBytes < 0:
+		return fail("capacity cannot be negative")
+	case req.AvailableCapacityBytes > req.TotalCapacityBytes && req.TotalCapacityBytes > 0:
+		return fail("available capacity exceeds total capacity")
 	}
 
-	// Upsert query with libp2p fields
-	query := `
+	// Empty location fields keep the stored values on re-registration (new
+	// peers get '' / UTC defaults in the INSERT).
+	tz := req.Timezone
+	if tz != "" {
+		if _, err := time.LoadLocation(tz); err != nil {
+			return fail(fmt.Sprintf("timezone %q is not an IANA name (e.g. America/Guyana)", tz))
+		}
+	}
+	primary := req.Multiaddr
+	if primary == "" && len(req.Multiaddrs) > 0 {
+		primary = req.Multiaddrs[0]
+	}
+
+	// Conflict on peer_id when the client already has one, otherwise on the
+	// libp2p identity, so re-registering never creates a duplicate row.
+	conflict := "peer_id"
+	peerID := sql.NullString{String: req.PeerId, Valid: req.PeerId != ""}
+	if !peerID.Valid {
+		conflict = "libp2p_peer_id"
+	}
+	query := fmt.Sprintf(`
 		INSERT INTO peers (
-			peer_id,
-			user_id,
-			libp2p_peer_id,
-			multiaddr,
-			multiaddrs,
-			asn,
-			timezone,
-			region,
-			storage_total_gb,
-			storage_free_gb,
-			is_online,
-			health_score,
-			reliability_score,
-			uptime_percentage,
-			first_seen_at,
-			last_seen_at,
-			last_heartbeat_at
+			peer_id, user_id, libp2p_peer_id, multiaddr, multiaddrs, asn, timezone, region,
+			device_model, os_type, app_version, storage_total_gb, storage_free_gb,
+			is_online, first_seen_at, last_seen_at, last_heartbeat_at, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-			true, 100.0, 1.000, 0.0, $11, $11, $11
+			COALESCE($1::UUID, gen_random_uuid()), $2, $3, $4, $5,
+			COALESCE($6, ''), COALESCE($7, 'UTC'), COALESCE($8, ''),
+			$9, $10, $11, $12, $13, true, now(), now(), now(), now()
 		)
-		ON CONFLICT (peer_id) DO UPDATE SET
-			libp2p_peer_id = EXCLUDED.libp2p_peer_id,
-			multiaddr = EXCLUDED.multiaddr,
-			multiaddrs = EXCLUDED.multiaddrs,
-			storage_total_gb = EXCLUDED.storage_total_gb,
-			storage_free_gb = EXCLUDED.storage_free_gb,
-			asn = EXCLUDED.asn,
-			timezone = EXCLUDED.timezone,
-			region = EXCLUDED.region,
-			is_online = true,
-			last_seen_at = EXCLUDED.last_seen_at,
-			last_heartbeat_at = EXCLUDED.last_heartbeat_at
-		RETURNING peer_id
-	`
-	
+		ON CONFLICT (%s) DO UPDATE SET
+			user_id           = COALESCE(excluded.user_id, peers.user_id),
+			libp2p_peer_id    = COALESCE(excluded.libp2p_peer_id, peers.libp2p_peer_id),
+			multiaddr         = COALESCE(excluded.multiaddr, peers.multiaddr),
+			multiaddrs        = COALESCE(excluded.multiaddrs, peers.multiaddrs),
+			asn               = COALESCE($6, peers.asn),
+			timezone          = COALESCE($7, peers.timezone),
+			region            = COALESCE($8, peers.region),
+			device_model      = COALESCE(excluded.device_model, peers.device_model),
+			os_type           = COALESCE(excluded.os_type, peers.os_type),
+			app_version       = COALESCE(excluded.app_version, peers.app_version),
+			storage_total_gb  = excluded.storage_total_gb,
+			storage_free_gb   = excluded.storage_free_gb,
+			is_online         = true,
+			last_seen_at      = now(),
+			last_heartbeat_at = now(),
+			updated_at        = now()
+		RETURNING peer_id`, conflict)
+
+	var multiaddrs interface{}
+	if len(req.Multiaddrs) > 0 {
+		multiaddrs = pq.Array(req.Multiaddrs)
+	}
+	var id string
 	err := s.db.QueryRowContext(ctx, query,
-		req.PeerId,
-		nil,  // user_id is nullable
-		req.Libp2PPeerId,
-		req.Multiaddr,
-		pq.Array(req.Multiaddrs),  // Convert to PostgreSQL array
-		req.Asn,
-		timezone,
-		req.Region,
-		totalGB,
-		freeGB,
-		now,
-	).Scan(&peerID)
-
+		peerID,
+		common.NullIfEmpty(req.UserId),
+		common.NullIfEmpty(req.Libp2PPeerId),
+		common.NullIfEmpty(primary),
+		multiaddrs,
+		common.NullIfEmpty(req.Asn), common.NullIfEmpty(tz), common.NullIfEmpty(req.Region),
+		common.NullIfEmpty(req.DeviceModel), common.NullIfEmpty(req.OsType), common.NullIfEmpty(req.Version),
+		req.TotalCapacityBytes/gb,
+		float64(req.AvailableCapacityBytes)/gb,
+	).Scan(&id)
+	if common.IsUniqueViolation(err) {
+		return fail("libp2p_peer_id is already registered to a different peer_id")
+	}
 	if err != nil {
-		log.Printf("Failed to register peer %s: %v", req.PeerId, err)
-		return &pb.RegistrationResponse{
-			Success: false,
-			Message: fmt.Sprintf("Registration failed: %v", err),
-			PeerId:  "",
-		}, nil
+		log.Printf("RegisterPeer DB error: %v", err)
+		return fail("registration failed: " + err.Error())
 	}
 
-	log.Printf("✓ Registered peer: %s", peerID)
-
-	return &pb.RegistrationResponse{
-		PeerId:  peerID,
-		Success: true,
-		Message: "Peer registered successfully",
-	}, nil
+	log.Printf("registered peer %s (libp2p %s)", id, req.Libp2PPeerId)
+	return &pb.RegistrationResponse{Success: true, Message: "peer registered", PeerId: id}, nil
 }
 
-// Heartbeat processes peer heartbeat and updates status (UPDATED FOR LIBP2P)
-func (s *PeerRegistryServer) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
-	log.Printf("Heartbeat from peer: %s", req.PeerId)
+// Heartbeat marks a peer online and refreshes capacity, device state and
+// addresses. Fields left empty keep their stored values.
+func (s *server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	if req.PeerId == "" {
+		return &pb.HeartbeatResponse{Success: false, Message: "peer_id is required"}, nil
+	}
+	var multiaddrs interface{}
+	if len(req.Multiaddrs) > 0 {
+		multiaddrs = pq.Array(req.Multiaddrs)
+	}
+	// Proto3 cannot tell 0 from "not sent", and a device reporting 0% battery
+	// is not running, so only 1-100 updates the stored level.
+	battery := sql.NullInt32{Int32: req.BatteryLevel, Valid: req.BatteryLevel >= 1 && req.BatteryLevel <= 100}
 
-	now := time.Now()
-	
-	// Convert bytes to GB
-	freeGB := float64(req.AvailableCapacityBytes) / (1024 * 1024 * 1024)
-
-	// Update peer status with libp2p multiaddrs
-	query := `
+	res, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE peers SET
-			is_online = true,
-			storage_free_gb = $1,
-			multiaddrs = $2,
-			last_seen_at = $3,
-			last_heartbeat_at = $3
-		WHERE peer_id = $4
-	`
-
-	result, err := s.db.ExecContext(ctx, query,
-		freeGB,
-		pq.Array(req.Multiaddrs),  // Update multiaddrs from heartbeat
-		now,
-		req.PeerId,
-	)
-
+			is_online         = true,
+			storage_free_gb   = $1,
+			multiaddrs        = COALESCE($2, multiaddrs),
+			multiaddr         = COALESCE(($2::TEXT[])[1], multiaddr),
+			is_charging       = $3,
+			battery_level     = COALESCE($4, battery_level),
+			network_type      = COALESCE($5, network_type),
+			last_seen_at      = now(),
+			last_heartbeat_at = now(),
+			updated_at        = now()
+		WHERE %s = $6`, idColumn(req.PeerId)),
+		float64(req.AvailableCapacityBytes)/gb, multiaddrs, req.IsCharging, battery,
+		common.NullIfEmpty(req.NetworkType), req.PeerId)
 	if err != nil {
-		log.Printf("Heartbeat failed for peer %s: %v", req.PeerId, err)
-		return &pb.HeartbeatResponse{
-			Success: false,
-			Message: fmt.Sprintf("Heartbeat failed: %v", err),
-		}, nil
+		log.Printf("Heartbeat %s DB error: %v", req.PeerId, err)
+		return &pb.HeartbeatResponse{Success: false, Message: "heartbeat failed: " + err.Error()}, nil
 	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return &pb.HeartbeatResponse{
-			Success: false,
-			Message: "Peer not found - please register first",
-		}, nil
+	if n, _ := res.RowsAffected(); n == 0 {
+		return &pb.HeartbeatResponse{Success: false, Message: "peer not found - please register first"}, nil
 	}
-
-	return &pb.HeartbeatResponse{
-		Success: true,
-		Message: "Heartbeat processed",
-	}, nil
+	return &pb.HeartbeatResponse{Success: true, Message: "heartbeat processed"}, nil
 }
 
-// GetPeer retrieves detailed peer information (UPDATED FOR LIBP2P)
-func (s *PeerRegistryServer) GetPeer(ctx context.Context, req *pb.PeerRequest) (*pb.PeerInfo, error) {
-	query := `
-		SELECT peer_id, libp2p_peer_id, multiaddr, asn, region,
-		       storage_total_gb, storage_free_gb, health_score,
-		       is_online, last_heartbeat_at
-		FROM peers
-		WHERE peer_id = $1 OR libp2p_peer_id = $1
-	`
+const peerColumns = `peer_id, user_id, libp2p_peer_id, multiaddr, multiaddrs, asn, region, timezone,
+	storage_total_gb, storage_free_gb, health_score, is_online, last_heartbeat_at`
 
+type rowScanner interface{ Scan(...interface{}) error }
+
+func scanPeer(r rowScanner) (*pb.PeerInfo, error) {
 	var (
-		peerID        string
-		libp2pPeerID  sql.NullString
-		multiaddr     sql.NullString
-		asn           string
-		region        string
-		totalGB       int
-		freeGB        float64
-		healthScore   float64
-		isOnline      bool
-		lastHeartbeat time.Time
+		p              pb.PeerInfo
+		userID, libp2p sql.NullString
+		multiaddr      sql.NullString
+		multiaddrs     []string
+		totalGB        int64
+		freeGB, health float64
+		online         bool
+		lastHeartbeat  time.Time
 	)
-
-	err := s.db.QueryRowContext(ctx, query, req.PeerId).Scan(
-		&peerID, &libp2pPeerID, &multiaddr, &asn, &region,
-		&totalGB, &freeGB, &healthScore, &isOnline, &lastHeartbeat,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, status.Errorf(codes.NotFound, "peer not found")
-	} else if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get peer: %v", err)
+	if err := r.Scan(&p.PeerId, &userID, &libp2p, &multiaddr, pq.Array(&multiaddrs), &p.Asn, &p.Region,
+		&p.Timezone, &totalGB, &freeGB, &health, &online, &lastHeartbeat); err != nil {
+		return nil, err
 	}
-
-	peerInfo := &pb.PeerInfo{
-		PeerId:                peerID,
-		Libp2PPeerId:         libp2pPeerID.String,
-		Multiaddr:            multiaddr.String,
-		Asn:                  asn,
-		Region:               region,
-		TotalCapacityBytes:   int64(totalGB) * 1024 * 1024 * 1024,
-		AvailableCapacityBytes: int64(freeGB * 1024 * 1024 * 1024),
-		HealthScore:          healthScore,
-		Status:               getStatusString(isOnline),
-		LastHeartbeat:        lastHeartbeat.Unix(),
+	p.UserId = userID.String
+	p.Libp2PPeerId = libp2p.String
+	p.Multiaddr = multiaddr.String
+	p.Multiaddrs = multiaddrs
+	p.TotalCapacityBytes = totalGB * gb
+	p.AvailableCapacityBytes = int64(freeGB * gb)
+	p.HealthScore = health
+	p.Status = "inactive"
+	if online {
+		p.Status = "active"
 	}
-
-	return peerInfo, nil
+	p.LastHeartbeat = lastHeartbeat.Unix()
+	return &p, nil
 }
 
-// ListPeers returns a list of peers with optional filtering
-func (s *PeerRegistryServer) ListPeers(ctx context.Context, req *pb.ListPeersRequest) (*pb.PeerList, error) {
-	// Determine status filter
-	var statusFilter string
+// GetPeer looks a peer up by server UUID or libp2p peer ID.
+func (s *server) GetPeer(ctx context.Context, req *pb.PeerRequest) (*pb.PeerInfo, error) {
+	if req.PeerId == "" {
+		return nil, status.Error(codes.InvalidArgument, "peer_id is required")
+	}
+	row := s.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM peers WHERE %s = $1`, peerColumns, idColumn(req.PeerId)), req.PeerId)
+	p, err := scanPeer(row)
+	if err == sql.ErrNoRows {
+		return nil, status.Error(codes.NotFound, "peer not found")
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get peer: %v", err)
+	}
+	return p, nil
+}
+
+// ListPeers returns one page of peers plus the total matching the filter.
+func (s *server) ListPeers(ctx context.Context, req *pb.ListPeersRequest) (*pb.PeerList, error) {
+	where := []string{"health_score >= $1"}
 	switch req.Status {
 	case "active":
-		statusFilter = " AND is_online = true"
+		where = append(where, "is_online = true")
 	case "inactive":
-		statusFilter = " AND is_online = false"
+		where = append(where, "is_online = false")
+	case "", "all":
 	default:
-		statusFilter = "" // all
+		return nil, status.Error(codes.InvalidArgument, `status must be "active", "inactive" or "all"`)
 	}
-
 	limit := req.Limit
-	if limit == 0 || limit > 1000 {
+	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
+	offset := req.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	cond := strings.Join(where, " AND ")
 
-	query := fmt.Sprintf(`
-		SELECT peer_id, libp2p_peer_id, multiaddr, asn, region,
-		       storage_total_gb, storage_free_gb, health_score,
-		       is_online, last_heartbeat_at
-		FROM peers
-		WHERE health_score >= $1 %s
-		ORDER BY health_score DESC
-		LIMIT $2
-	`, statusFilter)
-
-	rows, err := s.db.QueryContext(ctx, query,
-		s.config.MinHealthScore, limit,
-	)
+	var total int32
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM peers WHERE `+cond, req.MinHealthScore).Scan(&total); err != nil {
+		return nil, status.Errorf(codes.Internal, "count peers: %v", err)
+	}
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM peers WHERE %s ORDER BY health_score DESC, peer_id LIMIT $2 OFFSET $3`, peerColumns, cond),
+		req.MinHealthScore, limit, offset)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to list peers: %v", err)
+		return nil, status.Errorf(codes.Internal, "list peers: %v", err)
 	}
 	defer rows.Close()
 
-	var peers []*pb.PeerInfo
+	out := &pb.PeerList{TotalCount: total}
 	for rows.Next() {
-		var (
-			peerID        string
-			libp2pPeerID  sql.NullString
-			multiaddr     sql.NullString
-			asn           string
-			region        string
-			totalGB       int
-			freeGB        float64
-			healthScore   float64
-			isOnline      bool
-			lastHeartbeat time.Time
-		)
-
-		if err := rows.Scan(&peerID, &libp2pPeerID, &multiaddr, &asn, &region,
-			&totalGB, &freeGB, &healthScore, &isOnline, &lastHeartbeat); err != nil {
-			continue
-		}
-
-		peers = append(peers, &pb.PeerInfo{
-			PeerId:                peerID,
-			Libp2PPeerId:         libp2pPeerID.String,
-			Multiaddr:            multiaddr.String,
-			Asn:                  asn,
-			Region:               region,
-			TotalCapacityBytes:   int64(totalGB) * 1024 * 1024 * 1024,
-			AvailableCapacityBytes: int64(freeGB * 1024 * 1024 * 1024),
-			HealthScore:          healthScore,
-			Status:               getStatusString(isOnline),
-			LastHeartbeat:        lastHeartbeat.Unix(),
-		})
-	}
-
-	return &pb.PeerList{
-		Peers:      peers,
-		TotalCount: int32(len(peers)),
-	}, nil
-}
-
-// Helper methods
-
-func getStatusString(isOnline bool) string {
-	if isOnline {
-		return "active"
-	}
-	return "inactive"
-}
-
-// Background job to mark inactive peers offline
-func (s *PeerRegistryServer) runInactivityChecker() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		timeout := time.Duration(s.config.HeartbeatTimeout) * time.Second
-		cutoff := time.Now().Add(-timeout)
-
-		query := `
-			UPDATE peers
-			SET is_online = false
-			WHERE is_online = true
-			  AND last_heartbeat_at < $1
-		`
-
-		result, err := s.db.Exec(query, cutoff)
+		p, err := scanPeer(rows)
 		if err != nil {
-			log.Printf("Error marking peers offline: %v", err)
-			continue
+			return nil, status.Errorf(codes.Internal, "scan peer: %v", err)
 		}
+		out.Peers = append(out.Peers, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, status.Errorf(codes.Internal, "list peers: %v", err)
+	}
+	return out, nil
+}
 
-		rowsAffected, _ := result.RowsAffected()
-		if rowsAffected > 0 {
-			log.Printf("Marked %d peers as offline", rowsAffected)
-		}
+// markOffline flags peers whose last heartbeat is older than the timeout.
+// It is a single idempotent UPDATE, so running it in several replicas is safe.
+func (s *server) markOffline(ctx context.Context) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE peers SET is_online = false, updated_at = now()
+		WHERE is_online = true AND last_heartbeat_at < now() - $1::INTERVAL`,
+		fmt.Sprintf("%d seconds", int(s.cfg.HeartbeatTimeout.Seconds())))
+	if err != nil {
+		log.Printf("inactivity check: %v", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("marked %d peers offline", n)
 	}
 }
 
 func main() {
-	log.Println("Starting Peer Registry Service with libp2p support...")
+	ctx, stop := common.SignalContext()
+	defer stop()
 
-	config := loadConfig()
-
-	// Connect to database
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		config.DBHost, config.DBPort, config.DBUser, config.DBPassword, config.DBName)
-
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
-	}
+	cfg := loadConfig()
+	db := common.MustOpenDB(ctx, requiredSchema)
 	defer db.Close()
 
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
-	}
+	s := &server{db: db, cfg: cfg}
+	go common.RunEvery(ctx, "inactivity-check", cfg.CheckInterval, s.markOffline)
 
-	log.Println("✓ Connected to database successfully")
-
-	// Create server
-	server := &PeerRegistryServer{
-		db:     db,
-		config: config,
-	}
-
-	// Start background jobs
-	go server.runInactivityChecker()
-
-	// Create gRPC server
-	lis, err := net.Listen("tcp", ":"+config.GRPCPort)
-	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
-	}
-
-	grpcServer := grpc.NewServer()
-	pb.RegisterPeerRegistryServer(grpcServer, server)
-	reflection.Register(grpcServer)
-
-	log.Printf("✓ Peer Registry Service listening on port %s", config.GRPCPort)
-
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
-	}
+	common.ServeGRPC(ctx, "peer-registry", cfg.GRPCPort, func(g *grpc.Server) {
+		pb.RegisterPeerRegistryServer(g, s)
+	})
 }

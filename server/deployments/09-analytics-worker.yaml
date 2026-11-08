@@ -1,5 +1,6 @@
----
-# Analytics Worker - ML predictions, usage analytics
+# analytics-worker
+# Test deployment: one replica. Background jobs are safe to scale (they claim
+# work atomically), but one pod per service is plenty for a test cluster.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,7 +8,7 @@ metadata:
   namespace: orchestrator
   labels:
     app: analytics-worker
-    tier: worker
+    tier: service
 spec:
   replicas: 1
   selector:
@@ -17,49 +18,27 @@ spec:
     metadata:
       labels:
         app: analytics-worker
-        tier: worker
+        tier: service
     spec:
-      serviceAccountName: analytics-worker
+      serviceAccountName: worker-sa
       containers:
       - name: analytics-worker
-        image: analytics-worker:v1.0.0
-        imagePullPolicy: IfNotPresent
-        env:
-        - name: WORKER_TYPE
-          value: "analytics"
-        - name: POLL_INTERVAL_SECONDS
-          value: "600"
-        - name: BATCH_SIZE
-          value: "1000"
-        - name: ML_MODEL_PATH
-          value: "/models/churn-prediction.pkl"
-        - name: PREDICTION_THRESHOLD
-          value: "0.7"
-        - name: LOG_LEVEL
-          value: "info"
+        image: orchestrator/analytics-worker:dev
+        imagePullPolicy: Never   # install.sh imports the image into containerd
         envFrom:
         - configMapRef:
             name: orchestrator-config
-        - secretRef:
-            name: database-credentials
+        env:
+        - name: SERVICE_NAME
+          value: "analytics-worker"
+        - name: POLL_INTERVAL_SECONDS
+          value: "600"
+        - name: CHURN_THRESHOLD
+          value: "0.7"
         resources:
           requests:
-            cpu: 500m
-            memory: 1Gi
+            cpu: 50m
+            memory: 64Mi
           limits:
-            cpu: 1000m
-            memory: 2Gi
-        livenessProbe:
-          exec:
-            command: ["/bin/sh", "-c", "ps aux | grep analytics-worker | grep -v grep"]
-          initialDelaySeconds: 30
-          periodSeconds: 60
-        volumeMounts:
-        - name: ml-models
-          mountPath: /models
-          readOnly: true
-      volumes:
-      - name: ml-models
-        configMap:
-          name: ml-models
-          optional: true
+            cpu: 500m
+            memory: 256Mi

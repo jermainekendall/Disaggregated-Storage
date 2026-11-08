@@ -1,0 +1,27 @@
+# Compiled service binaries (built by `make build`, `go build` or install.sh)
+/bin/
+/services/*/api-gateway
+/services/*/peer-registry
+/services/*/placement-service
+/services/*/audit-service
+/services/*/billing-service
+/services/*/key-metadata
+/services/*/repair-worker
+/services/*/replication-worker
+/services/*/analytics-worker
+/services/*/relay-service
+*.old
+*.backup
+logs/
+relay.key
+# `go build ./services/<name>` run from server/ drops the binary here
+/api-gateway
+/peer-registry
+/placement-service
+/audit-service
+/billing-service
+/key-metadata
+/repair-worker
+/replication-worker
+/analytics-worker
+/relay-service

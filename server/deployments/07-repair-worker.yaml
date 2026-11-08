@@ -1,5 +1,6 @@
----
-# Repair Worker - Background job to repair degraded files
+# repair-worker
+# Test deployment: one replica. Background jobs are safe to scale (they claim
+# work atomically), but one pod per service is plenty for a test cluster.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,9 +8,9 @@ metadata:
   namespace: orchestrator
   labels:
     app: repair-worker
-    tier: worker
+    tier: service
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: repair-worker
@@ -17,51 +18,31 @@ spec:
     metadata:
       labels:
         app: repair-worker
-        tier: worker
+        tier: service
     spec:
-      serviceAccountName: repair-worker
+      serviceAccountName: worker-sa
       containers:
       - name: repair-worker
-        image: repair-worker:v1.0.0
-        imagePullPolicy: IfNotPresent
+        image: orchestrator/repair-worker:dev
+        imagePullPolicy: Never   # install.sh imports the image into containerd
+        envFrom:
+        - configMapRef:
+            name: orchestrator-config
         env:
-        - name: WORKER_TYPE
-          value: "repair"
+        - name: SERVICE_NAME
+          value: "repair-worker"
         - name: POLL_INTERVAL_SECONDS
           value: "60"
         - name: BATCH_SIZE
           value: "10"
         - name: MAX_CONCURRENT_REPAIRS
           value: "5"
-        - name: REPAIR_PRIORITY_THRESHOLD
-          value: "10"
-        - name: LOG_LEVEL
-          value: "info"
-        envFrom:
-        - configMapRef:
-            name: orchestrator-config
-        - secretRef:
-            name: database-credentials
+        - name: REBUILD_TIMEOUT_HOURS
+          value: "24"
         resources:
           requests:
-            cpu: 200m
-            memory: 256Mi
+            cpu: 50m
+            memory: 64Mi
           limits:
             cpu: 500m
-            memory: 512Mi
-        livenessProbe:
-          exec:
-            command: ["/bin/sh", "-c", "ps aux | grep repair-worker | grep -v grep"]
-          initialDelaySeconds: 30
-          periodSeconds: 60
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: repair-worker-pdb
-  namespace: orchestrator
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: repair-worker
+            memory: 256Mi

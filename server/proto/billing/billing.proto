@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package billing;
+option go_package = "github.com/jermainekendall/disaggregated-storage/server/proto/billing";
+
+// BillingService computes peer earnings per calendar month and handles payouts.
+// Payouts are per user (a user can own several peers).
+service BillingService {
+  rpc CalculateEarnings(CalculateEarningsRequest) returns (EarningsRecord);
+  rpc ListEarnings(ListEarningsRequest) returns (EarningsList);
+  rpc GetBalance(BalanceRequest) returns (BalanceResponse);
+  rpc ProcessPayout(PayoutRequest) returns (PayoutResponse);
+  rpc GetPayoutHistory(PayoutHistoryRequest) returns (PayoutHistoryResponse);
+  rpc UpdatePaymentMethod(UpdatePaymentRequest) returns (UpdatePaymentResponse);
+}
+
+message CalculateEarningsRequest {
+  string peer_id = 1;
+  int32 year = 2;
+  int32 month = 3; // 1-12; the whole calendar month is billed
+}
+
+message EarningsRecord {
+  string earning_id = 1;
+  string peer_id = 2;
+  string period_start = 3; // YYYY-MM-DD
+  string period_end = 4;   // YYYY-MM-DD, exclusive
+  double storage_gb_days = 5;
+  double bandwidth_gb = 6;
+  double gross_earnings_usd = 7;
+  double reliability_bonus_usd = 8;
+  double audit_penalty_usd = 9;
+  double net_earnings_usd = 10;
+  string status = 11;
+}
+
+message ListEarningsRequest {
+  string user_id = 1;
+  string peer_id = 2;
+  int32 limit = 3;
+}
+
+message EarningsList {
+  repeated EarningsRecord earnings = 1;
+}
+
+message BalanceRequest {
+  string user_id = 1;
+}
+
+message BalanceResponse {
+  double earned_usd = 1;   // pending + approved earnings
+  double paid_out_usd = 2; // payouts not failed (pending, processing, completed)
+  double available_usd = 3;
+}
+
+message PayoutRequest {
+  string user_id = 1;
+  double amount_usd = 2;
+}
+
+message PayoutResponse {
+  string payout_id = 1;
+  string status = 2;
+  string message = 3;
+  int32 estimated_days = 4;
+}
+
+message PayoutHistoryRequest {
+  string user_id = 1;
+  int32 limit = 2;
+}
+
+message PayoutRecord {
+  string payout_id = 1;
+  double amount_usd = 2;
+  string payment_method = 3;
+  string status = 4;
+  int64 created_at = 5;
+  int64 completed_at = 6;
+}
+
+message PayoutHistoryResponse {
+  repeated PayoutRecord payouts = 1;
+  int32 total = 2;
+}
+
+message UpdatePaymentRequest {
+  string user_id = 1;
+  string payment_method = 2; // paypal, bank, crypto, gift_card, platform_credit
+  string payment_email = 3;
+  string payment_address = 4;
+}
+
+message UpdatePaymentResponse {
+  bool success = 1;
+  string message = 2;
+}

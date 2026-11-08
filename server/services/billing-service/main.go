@@ -1,552 +1,501 @@
-// Billing Service - Complete Production Implementation
-// Calculates earnings and processes payouts
-// File: services/billing-service/main.go
-
+// Billing Service: monthly peer earnings and user payouts.
+//
+// Earnings are computed per peer per calendar month from the shards it held
+// during that month (GB-days by storage tier), the bytes it served during the
+// month, a reliability bonus and a penalty for failed audits. Payouts are per
+// user, because one user can own several peers.
+//
+// Test deployment: payments are simulated. A payout is marked completed after
+// PAYMENT_SIMULATION_DELAY with external_transaction_id "simulated-<id>".
 package main
 
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log"
-	"net"
-	"os"
 	"time"
 
-	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
+
+	"github.com/jermainekendall/disaggregated-storage/server/internal/common"
+	pb "github.com/jermainekendall/disaggregated-storage/server/proto/billing"
 )
 
-// Configuration
-type Config struct {
-	DBHost             string
-	DBPort             string
-	DBName             string
-	DBUser             string
-	DBPassword         string
-	GRPCPort           string
-	BillingCycleDay    int
-	PayoutProcessingDay int
-	MinPayoutAmount    float64
-	PeerRevenueShare   float64 // 0.65 = 65%
+type config struct {
+	GRPCPort         string
+	CheckInterval    time.Duration
+	RunBackground    bool
+	SimulatePayments bool
+	SimulationDelay  time.Duration
 }
 
-func loadConfig() *Config {
-	return &Config{
-		DBHost:             getEnv("DB_HOST", "cockroachdb-public"),
-		DBPort:             getEnv("DB_PORT", "26257"),
-		DBName:             getEnv("DB_NAME", "orchestrator"),
-		DBUser:             getEnv("DB_USER", "root"),
-		DBPassword:         getEnv("DB_PASSWORD", ""),
-		GRPCPort:           getEnv("GRPC_PORT", "50055"),
-		BillingCycleDay:    1,  // First of month
-		PayoutProcessingDay: 5,  // 5th of month
-		MinPayoutAmount:    10.0, // $10 minimum
-		PeerRevenueShare:   0.65, // 65% to peers
+func loadConfig() config {
+	return config{
+		GRPCPort:         common.Env("GRPC_PORT", "50053"),
+		CheckInterval:    common.EnvDuration("BILLING_CHECK_INTERVAL", time.Hour),
+		RunBackground:    common.EnvBool("RUN_BACKGROUND_JOBS", true),
+		SimulatePayments: common.EnvBool("SIMULATE_PAYMENTS", true),
+		SimulationDelay:  common.EnvDuration("PAYMENT_SIMULATION_DELAY", 5*time.Second),
 	}
 }
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
+var requiredSchema = map[string][]string{
+	"earnings": {"earning_id", "peer_id", "user_id", "period_start", "period_end", "storage_gb_days",
+		"base_rate_usd", "bandwidth_gb", "bandwidth_earnings_usd", "bytes_served_snapshot",
+		"gross_earnings_usd", "reliability_bonus_usd", "audit_penalty_usd", "net_earnings_usd", "status"},
+	"payouts": {"payout_id", "user_id", "amount_usd", "period_start", "period_end", "payment_method",
+		"payment_email", "payment_address", "status", "external_transaction_id", "created_at",
+		"processed_at", "completed_at", "failure_reason"},
+	"users":         {"user_id", "payment_method", "payment_email", "payment_address", "updated_at"},
+	"peers":         {"peer_id", "user_id", "bytes_served", "uptime_percentage", "last_seen_at"},
+	"shards":        {"peer_id", "file_id", "shard_size_bytes", "health_status", "stored_at", "removed_at"},
+	"files":         {"file_id", "storage_tier"},
+	"audit_logs":    {"peer_id", "status", "verified_at"},
+	"system_config": {"config_key", "config_value"},
 }
 
-// BillingServiceServer implements the billing service
-type BillingServiceServer struct {
-	db     *sql.DB
-	config *Config
+type server struct {
+	pb.UnimplementedBillingServiceServer
+	db  *sql.DB
+	cfg config
 }
 
-// CalculateEarnings calculates monthly earnings for a peer
-func (s *BillingServiceServer) CalculateEarnings(ctx context.Context, req *CalculateEarningsRequest) (*EarningsResponse, error) {
-	log.Printf("CalculateEarnings called for peer: %s, month: %d/%d",
-		req.PeerId, req.Month, req.Year)
-
-	// Get peer's storage contribution for the month
-	storageEarnings, err := s.calculateStorageEarnings(ctx, req.PeerId, req.Month, req.Year)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to calculate storage: %v", err)
+// configFloat reads a numeric system_config value, falling back to def.
+func configFloat(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}, key string, def float64) float64 {
+	var v float64
+	if err := q.QueryRowContext(ctx,
+		`SELECT config_value::FLOAT8 FROM system_config WHERE config_key = $1`, key).Scan(&v); err != nil {
+		return def
 	}
-
-	// Get peer's bandwidth contribution
-	bandwidthEarnings, err := s.calculateBandwidthEarnings(ctx, req.PeerId, req.Month, req.Year)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to calculate bandwidth: %v", err)
-	}
-
-	// Calculate bonus for high uptime
-	uptimeBonus, err := s.calculateUptimeBonus(ctx, req.PeerId, req.Month, req.Year)
-	if err != nil {
-		log.Printf("Warning: Failed to calculate uptime bonus: %v", err)
-		uptimeBonus = 0
-	}
-
-	// Total earnings
-	totalEarnings := storageEarnings + bandwidthEarnings + uptimeBonus
-
-	// Store earnings record
-	now := time.Now()
-	query := `
-		INSERT INTO earnings (
-			peer_id, month, year, storage_earnings, bandwidth_earnings,
-			uptime_bonus, total_earnings, calculated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (peer_id, month, year)
-		DO UPDATE SET
-			storage_earnings = EXCLUDED.storage_earnings,
-			bandwidth_earnings = EXCLUDED.bandwidth_earnings,
-			uptime_bonus = EXCLUDED.uptime_bonus,
-			total_earnings = EXCLUDED.total_earnings,
-			calculated_at = EXCLUDED.calculated_at
-		RETURNING earning_id
-	`
-
-	var earningID string
-	err = s.db.QueryRowContext(ctx, query,
-		req.PeerId, req.Month, req.Year,
-		storageEarnings, bandwidthEarnings, uptimeBonus,
-		totalEarnings, now,
-	).Scan(&earningID)
-
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to store earnings: %v", err)
-	}
-
-	log.Printf("Calculated earnings for peer %s: $%.2f", req.PeerId, totalEarnings)
-
-	return &EarningsResponse{
-		EarningId:          earningID,
-		PeerId:             req.PeerId,
-		StorageEarnings:    storageEarnings,
-		BandwidthEarnings:  bandwidthEarnings,
-		UptimeBonus:        uptimeBonus,
-		TotalEarnings:      totalEarnings,
-		Month:              req.Month,
-		Year:               req.Year,
-	}, nil
+	return v
 }
 
-// ProcessPayout initiates a payout to a peer
-func (s *BillingServiceServer) ProcessPayout(ctx context.Context, req *PayoutRequest) (*PayoutResponse, error) {
-	log.Printf("ProcessPayout called for peer: %s, amount: $%.2f", req.PeerId, req.Amount)
-
-	// Verify peer has sufficient balance
-	var availableBalance float64
-	err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(total_earnings), 0) - COALESCE(SUM(amount), 0)
-		 FROM earnings e
-		 LEFT JOIN payouts p ON e.peer_id = p.peer_id AND p.status = 'completed'
-		 WHERE e.peer_id = $1`,
-		req.PeerId,
-	).Scan(&availableBalance)
-
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to check balance: %v", err)
-	}
-
-	if availableBalance < req.Amount {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"insufficient balance: have $%.2f, requested $%.2f",
-			availableBalance, req.Amount)
-	}
-
-	if req.Amount < s.config.MinPayoutAmount {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"amount below minimum payout: $%.2f", s.config.MinPayoutAmount)
-	}
-
-	// Get payment method
-	var paymentMethod, paymentDetails string
-	err = s.db.QueryRowContext(ctx,
-		"SELECT payment_method, payment_details FROM peers WHERE peer_id = $1",
-		req.PeerId,
-	).Scan(&paymentMethod, &paymentDetails)
-
-	if err == sql.ErrNoRows {
-		return nil, status.Errorf(codes.NotFound, "peer not found")
-	} else if err != nil {
-		return nil, status.Errorf(codes.Internal, "database error: %v", err)
-	}
-
-	if paymentMethod == "" {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"no payment method configured")
-	}
-
-	// Create payout record
-	now := time.Now()
-	var payoutID string
-	query := `
-		INSERT INTO payouts (
-			peer_id, amount, payment_method, payment_details,
-			status, initiated_at
-		) VALUES ($1, $2, $3, $4, 'pending', $5)
-		RETURNING payout_id
-	`
-
-	err = s.db.QueryRowContext(ctx, query,
-		req.PeerId, req.Amount, paymentMethod, paymentDetails, now,
-	).Scan(&payoutID)
-
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to create payout: %v", err)
-	}
-
-	// Process payment (in production, integrate with PayPal/Stripe/crypto)
-	go s.processPaymentAsync(payoutID, paymentMethod, paymentDetails, req.Amount)
-
-	log.Printf("Initiated payout %s for peer %s: $%.2f", payoutID, req.PeerId, req.Amount)
-
-	return &PayoutResponse{
-		PayoutId:      payoutID,
-		Status:        "pending",
-		Message:       "Payout initiated successfully",
-		EstimatedDays: 3,
-	}, nil
+func monthBounds(year, month int32) (time.Time, time.Time) {
+	start := time.Date(int(year), time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+	return start, start.AddDate(0, 1, 0)
 }
 
-// GetPayoutHistory retrieves payout history for a peer
-func (s *BillingServiceServer) GetPayoutHistory(ctx context.Context, req *PayoutHistoryRequest) (*PayoutHistoryResponse, error) {
-	query := `
-		SELECT payout_id, amount, payment_method, status,
-		       initiated_at, completed_at
-		FROM payouts
-		WHERE peer_id = $1
-		ORDER BY initiated_at DESC
-		LIMIT $2
-	`
-
-	limit := req.Limit
-	if limit == 0 || limit > 100 {
-		limit = 50
+// CalculateEarnings computes (or recomputes, while still pending) one peer's
+// earnings for a calendar month. A month in progress is billed up to now.
+func (s *server) CalculateEarnings(ctx context.Context, req *pb.CalculateEarningsRequest) (*pb.EarningsRecord, error) {
+	if !common.IsUUID(req.PeerId) {
+		return nil, status.Error(codes.InvalidArgument, "peer_id must be a UUID")
+	}
+	if req.Month < 1 || req.Month > 12 || req.Year < 2020 {
+		return nil, status.Error(codes.InvalidArgument, "year/month out of range")
+	}
+	start, end := monthBounds(req.Year, req.Month)
+	if start.After(time.Now()) {
+		return nil, status.Error(codes.InvalidArgument, "cannot bill a future month")
+	}
+	upTo := end
+	if now := time.Now().UTC(); now.Before(end) {
+		upTo = now
 	}
 
-	rows, err := s.db.QueryContext(ctx, query, req.PeerId, limit)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "query failed: %v", err)
-	}
-	defer rows.Close()
-
-	var payouts []*PayoutRecord
-	for rows.Next() {
-		var p PayoutRecord
-		var completedAt *time.Time
-
-		err := rows.Scan(&p.PayoutId, &p.Amount, &p.PaymentMethod,
-			&p.Status, &p.InitiatedAt, &completedAt)
+	var rec *pb.EarningsRecord
+	err := common.RunTx(ctx, s.db, func(tx *sql.Tx) error {
+		var userID sql.NullString
+		var bytesServed int64
+		var uptime float64
+		err := tx.QueryRowContext(ctx,
+			`SELECT user_id, bytes_served, uptime_percentage FROM peers WHERE peer_id = $1`, req.PeerId).
+			Scan(&userID, &bytesServed, &uptime)
+		if err == sql.ErrNoRows {
+			return status.Error(codes.NotFound, "peer not found")
+		}
 		if err != nil {
-			continue
+			return err
 		}
 
-		if completedAt != nil {
-			p.CompletedAt = completedAt.Unix()
-		}
-
-		payouts = append(payouts, &p)
-	}
-
-	return &PayoutHistoryResponse{
-		Payouts: payouts,
-		Total:   int32(len(payouts)),
-	}, nil
-}
-
-// UpdatePaymentMethod updates peer's payment preferences
-func (s *BillingServiceServer) UpdatePaymentMethod(ctx context.Context, req *UpdatePaymentRequest) (*UpdatePaymentResponse, error) {
-	log.Printf("UpdatePaymentMethod called for peer: %s", req.PeerId)
-
-	query := `
-		UPDATE peers SET
-			payment_method = $1,
-			payment_details = $2,
-			updated_at = $3
-		WHERE peer_id = $4
-	`
-
-	result, err := s.db.ExecContext(ctx, query,
-		req.PaymentMethod, req.PaymentDetails, time.Now(), req.PeerId,
-	)
-
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "update failed: %v", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return nil, status.Errorf(codes.NotFound, "peer not found")
-	}
-
-	return &UpdatePaymentResponse{
-		Success: true,
-		Message: "Payment method updated successfully",
-	}, nil
-}
-
-// Helper functions
-
-func (s *BillingServiceServer) calculateStorageEarnings(ctx context.Context, peerID string, month, year int32) (float64, error) {
-	// Calculate earnings based on GB-hours stored
-	// Rate: $0.001 per GB-hour (example rate)
-	storageRate := 0.001
-
-	query := `
-		SELECT COALESCE(SUM(size_gb * EXTRACT(EPOCH FROM (COALESCE(deleted_at, NOW()) - created_at)) / 3600), 0)
-		FROM shard_locations sl
-		JOIN shards s ON sl.shard_id = s.shard_id
-		WHERE sl.peer_id = $1
-		  AND EXTRACT(MONTH FROM sl.created_at) = $2
-		  AND EXTRACT(YEAR FROM sl.created_at) = $3
-	`
-
-	var gbHours float64
-	err := s.db.QueryRowContext(ctx, query, peerID, month, year).Scan(&gbHours)
-	if err != nil {
-		return 0, err
-	}
-
-	return gbHours * storageRate, nil
-}
-
-func (s *BillingServiceServer) calculateBandwidthEarnings(ctx context.Context, peerID string, month, year int32) (float64, error) {
-	// Calculate earnings based on bytes served
-	// Rate: $0.10 per GB served (example rate)
-	bandwidthRate := 0.10
-
-	query := `
-		SELECT COALESCE(bytes_served, 0) / (1024.0 * 1024.0 * 1024.0)
-		FROM peers
-		WHERE peer_id = $1
-	`
-
-	var gbServed float64
-	err := s.db.QueryRowContext(ctx, query, peerID).Scan(&gbServed)
-	if err != nil {
-		return 0, err
-	}
-
-	return gbServed * bandwidthRate * s.config.PeerRevenueShare, nil
-}
-
-func (s *BillingServiceServer) calculateUptimeBonus(ctx context.Context, peerID string, month, year int32) (float64, error) {
-	// Bonus for high uptime (>99%)
-	query := `
-		SELECT uptime_percentage
-		FROM peers
-		WHERE peer_id = $1
-	`
-
-	var uptime float64
-	err := s.db.QueryRowContext(ctx, query, peerID).Scan(&uptime)
-	if err != nil {
-		return 0, err
-	}
-
-	if uptime > 99.0 {
-		return 5.0, nil // $5 bonus for >99% uptime
-	} else if uptime > 95.0 {
-		return 2.0, nil // $2 bonus for >95% uptime
-	}
-
-	return 0, nil
-}
-
-func (s *BillingServiceServer) processPaymentAsync(payoutID, paymentMethod, paymentDetails string, amount float64) {
-	// In production, integrate with:
-	// - PayPal API
-	// - Stripe API
-	// - Cryptocurrency wallets
-	// - Bank transfers
-
-	log.Printf("Processing payment %s: %s for $%.2f", payoutID, paymentMethod, amount)
-
-	// Simulate payment processing
-	time.Sleep(5 * time.Second)
-
-	ctx := context.Background()
-
-	// Update payout status
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE payouts SET status = 'completed', completed_at = $1 WHERE payout_id = $2`,
-		time.Now(), payoutID,
-	)
-
-	if err != nil {
-		log.Printf("Error updating payout status: %v", err)
-		// Mark as failed
-		s.db.ExecContext(ctx,
-			`UPDATE payouts SET status = 'failed', error_message = $1 WHERE payout_id = $2`,
-			err.Error(), payoutID,
-		)
-	} else {
-		log.Printf("Payment %s completed successfully", payoutID)
-	}
-}
-
-// Background job to calculate monthly earnings
-func (s *BillingServiceServer) runMonthlyBilling() {
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		now := time.Now()
-
-		// Run on billing cycle day
-		if now.Day() != s.config.BillingCycleDay {
-			continue
-		}
-
-		log.Println("Running monthly billing cycle...")
-
-		ctx := context.Background()
-
-		// Get all active peers
-		rows, err := s.db.QueryContext(ctx,
-			"SELECT peer_id FROM peers WHERE is_online = true OR last_seen_at > $1",
-			now.AddDate(0, -1, 0),
-		)
+		// GB-days per tier: each shard copy counts for the part of the
+		// period between when it was stored and when it stopped counting.
+		rows, err := tx.QueryContext(ctx, `
+			SELECT f.storage_tier,
+			       COALESCE(sum(s.shard_size_bytes::FLOAT8 / 1073741824.0 *
+			           greatest(0, extract(epoch FROM
+			               least(COALESCE(s.removed_at, $3::TIMESTAMP), $3::TIMESTAMP)
+			               - greatest(s.stored_at, $2::TIMESTAMP)) / 86400.0)), 0)
+			FROM shards s JOIN files f ON f.file_id = s.file_id
+			WHERE s.peer_id = $1
+			  AND s.health_status != 'pending'
+			  AND s.stored_at < $3::TIMESTAMP
+			  AND COALESCE(s.removed_at, $3::TIMESTAMP) > $2::TIMESTAMP
+			GROUP BY f.storage_tier`, req.PeerId, start, upTo)
 		if err != nil {
-			log.Printf("Error querying peers: %v", err)
-			continue
+			return err
 		}
-
-		count := 0
-		month := int32(now.Month())
-		year := int32(now.Year())
-
+		var gbDays, storageUSD float64
 		for rows.Next() {
-			var peerID string
-			if err := rows.Scan(&peerID); err != nil {
-				continue
+			var tier string
+			var d float64
+			if err := rows.Scan(&tier, &d); err != nil {
+				rows.Close()
+				return err
 			}
-
-			// Calculate earnings
-			req := &CalculateEarningsRequest{
-				PeerId: peerID,
-				Month:  month,
-				Year:   year,
-			}
-
-			_, err := s.CalculateEarnings(ctx, req)
-			if err != nil {
-				log.Printf("Failed to calculate earnings for %s: %v", peerID, err)
-				continue
-			}
-
-			count++
+			rate := configFloat(ctx, s.db, "consumer_earnings_rate_"+tier, 0.0063) // USD per GB-month
+			gbDays += d
+			storageUSD += d * rate / 30.0
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
 
-		log.Printf("Calculated earnings for %d peers", count)
+		// Bandwidth: bytes served since the previous period's snapshot. A
+		// recalculation keeps this period's original snapshot, so bytes are
+		// never paid twice.
+		var prevSnap int64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(max(bytes_served_snapshot), 0) FROM earnings
+			WHERE peer_id = $1 AND period_start < $2`, req.PeerId, start).Scan(&prevSnap); err != nil {
+			return err
+		}
+		snap := bytesServed
+		var existingSnap sql.NullInt64
+		var existingStatus string
+		err = tx.QueryRowContext(ctx, `SELECT bytes_served_snapshot, status FROM earnings WHERE peer_id = $1 AND period_start = $2`,
+			req.PeerId, start).Scan(&existingSnap, &existingStatus)
+		if err == nil {
+			if existingStatus != "pending" {
+				rec, err = loadEarning(ctx, tx, req.PeerId, start)
+				return err // approved or paid: never rewrite
+			}
+			snap = existingSnap.Int64
+		} else if err != sql.ErrNoRows {
+			return err
+		}
+		bandwidthGB := float64(max64(snap-prevSnap, 0)) / (1 << 30)
+		bandwidthUSD := bandwidthGB * configFloat(ctx, s.db, "consumer_bandwidth_rate_gb", 0.01)
+
+		gross := storageUSD + bandwidthUSD
+		bonus := 0.0
+		switch {
+		case uptime > 99:
+			bonus = gross * 0.10
+		case uptime > 95:
+			bonus = gross * 0.05
+		}
+		var failures int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT count(*) FROM audit_logs
+			WHERE peer_id = $1 AND status IN ('failed', 'timeout')
+			  AND verified_at >= $2::TIMESTAMP AND verified_at < $3::TIMESTAMP`, req.PeerId, start, end).Scan(&failures); err != nil {
+			return err
+		}
+		penalty := minf(float64(failures)*configFloat(ctx, s.db, "audit_failure_penalty_usd", 0.01), gross+bonus)
+		net := gross + bonus - penalty
+		baseRate := 0.0
+		if gbDays > 0 {
+			baseRate = storageUSD / gbDays * 30
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO earnings (peer_id, user_id, period_start, period_end, storage_gb_days, base_rate_usd,
+			                      bandwidth_gb, bandwidth_earnings_usd, bytes_served_snapshot, gross_earnings_usd,
+			                      reliability_bonus_usd, audit_penalty_usd, net_earnings_usd, status, calculated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pending', now())
+			ON CONFLICT (peer_id, period_start) DO UPDATE SET
+				user_id = excluded.user_id, storage_gb_days = excluded.storage_gb_days,
+				base_rate_usd = excluded.base_rate_usd, bandwidth_gb = excluded.bandwidth_gb,
+				bandwidth_earnings_usd = excluded.bandwidth_earnings_usd,
+				gross_earnings_usd = excluded.gross_earnings_usd,
+				reliability_bonus_usd = excluded.reliability_bonus_usd,
+				audit_penalty_usd = excluded.audit_penalty_usd,
+				net_earnings_usd = excluded.net_earnings_usd, calculated_at = now()`,
+			req.PeerId, userID, start, end, gbDays, baseRate, bandwidthGB, bandwidthUSD, snap,
+			gross, bonus, penalty, net); err != nil {
+			return err
+		}
+		rec, err = loadEarning(ctx, tx, req.PeerId, start)
+		return err
+	})
+	if err != nil {
+		return nil, grpcErr(err, "calculate earnings")
+	}
+	return rec, nil
+}
+
+const earningCols = `earning_id, peer_id, period_start, period_end, storage_gb_days, bandwidth_gb,
+	gross_earnings_usd, reliability_bonus_usd, audit_penalty_usd, net_earnings_usd, status`
+
+func scanEarning(r interface{ Scan(...interface{}) error }) (*pb.EarningsRecord, error) {
+	var e pb.EarningsRecord
+	var ps, pe time.Time
+	if err := r.Scan(&e.EarningId, &e.PeerId, &ps, &pe, &e.StorageGbDays, &e.BandwidthGb, &e.GrossEarningsUsd,
+		&e.ReliabilityBonusUsd, &e.AuditPenaltyUsd, &e.NetEarningsUsd, &e.Status); err != nil {
+		return nil, err
+	}
+	e.PeriodStart, e.PeriodEnd = ps.Format("2006-01-02"), pe.Format("2006-01-02")
+	return &e, nil
+}
+
+func loadEarning(ctx context.Context, tx *sql.Tx, peerID string, start time.Time) (*pb.EarningsRecord, error) {
+	return scanEarning(tx.QueryRowContext(ctx,
+		`SELECT `+earningCols+` FROM earnings WHERE peer_id = $1 AND period_start = $2`, peerID, start))
+}
+
+func (s *server) ListEarnings(ctx context.Context, req *pb.ListEarningsRequest) (*pb.EarningsList, error) {
+	limit := req.Limit
+	if limit <= 0 || limit > 120 {
+		limit = 24
+	}
+	col, id := "user_id", req.UserId
+	if req.PeerId != "" {
+		col, id = "peer_id", req.PeerId
+	}
+	if !common.IsUUID(id) {
+		return nil, status.Error(codes.InvalidArgument, "set user_id or peer_id (UUID)")
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+earningCols+` FROM earnings WHERE `+col+` = $1 ORDER BY period_start DESC LIMIT $2`, id, limit)
+	if err != nil {
+		return nil, grpcErr(err, "list earnings")
+	}
+	defer rows.Close()
+	out := &pb.EarningsList{}
+	for rows.Next() {
+		e, err := scanEarning(rows)
+		if err != nil {
+			return nil, grpcErr(err, "list earnings")
+		}
+		out.Earnings = append(out.Earnings, e)
+	}
+	return out, grpcErr(rows.Err(), "list earnings")
+}
+
+// balance computes earned, paid out and available for a user. The two sums
+// are separate subqueries; joining earnings to payouts first would multiply
+// each side by the other's row count.
+func balance(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}, userID string) (earned, paid float64, err error) {
+	err = q.QueryRowContext(ctx, `
+		SELECT
+		  (SELECT COALESCE(sum(net_earnings_usd), 0)::FLOAT8 FROM earnings WHERE user_id = $1),
+		  (SELECT COALESCE(sum(amount_usd), 0)::FLOAT8 FROM payouts WHERE user_id = $1 AND status != 'failed')`,
+		userID).Scan(&earned, &paid)
+	return
+}
+
+func (s *server) GetBalance(ctx context.Context, req *pb.BalanceRequest) (*pb.BalanceResponse, error) {
+	if !common.IsUUID(req.UserId) {
+		return nil, status.Error(codes.InvalidArgument, "user_id must be a UUID")
+	}
+	earned, paid, err := balance(ctx, s.db, req.UserId)
+	if err != nil {
+		return nil, grpcErr(err, "balance")
+	}
+	return &pb.BalanceResponse{EarnedUsd: earned, PaidOutUsd: paid, AvailableUsd: earned - paid}, nil
+}
+
+// ProcessPayout creates a payout if the user's available balance covers it.
+// Pending and processing payouts already count against the balance, and the
+// user row is locked, so concurrent requests cannot spend the same money.
+func (s *server) ProcessPayout(ctx context.Context, req *pb.PayoutRequest) (*pb.PayoutResponse, error) {
+	if !common.IsUUID(req.UserId) {
+		return nil, status.Error(codes.InvalidArgument, "user_id must be a UUID")
+	}
+	minPayout := configFloat(ctx, s.db, "payout_minimum_usd", 5)
+	if req.AmountUsd < minPayout {
+		return nil, status.Errorf(codes.FailedPrecondition, "minimum payout is $%.2f", minPayout)
+	}
+
+	var payoutID string
+	err := common.RunTx(ctx, s.db, func(tx *sql.Tx) error {
+		var method, email, address sql.NullString
+		err := tx.QueryRowContext(ctx, `
+			SELECT payment_method, payment_email, payment_address FROM users
+			WHERE user_id = $1 FOR UPDATE`, req.UserId).Scan(&method, &email, &address)
+		if err == sql.ErrNoRows {
+			return status.Error(codes.NotFound, "user not found")
+		}
+		if err != nil {
+			return err
+		}
+		if method.String == "" {
+			return status.Error(codes.FailedPrecondition, "no payment method configured")
+		}
+		earned, paid, err := balance(ctx, tx, req.UserId)
+		if err != nil {
+			return err
+		}
+		if avail := earned - paid; avail+1e-9 < req.AmountUsd {
+			return status.Errorf(codes.FailedPrecondition,
+				"insufficient balance: have $%.2f, requested $%.2f", avail, req.AmountUsd)
+		}
+		return tx.QueryRowContext(ctx, `
+			INSERT INTO payouts (user_id, amount_usd, period_start, period_end, payment_method,
+			                     payment_email, payment_address, status)
+			SELECT $1, $2,
+			       COALESCE((SELECT min(period_start) FROM earnings WHERE user_id = $1), current_date),
+			       COALESCE((SELECT max(period_end) FROM earnings WHERE user_id = $1), current_date),
+			       $3, $4, $5, 'pending'
+			RETURNING payout_id`, req.UserId, req.AmountUsd, method, email, address).Scan(&payoutID)
+	})
+	if err != nil {
+		return nil, grpcErr(err, "payout")
+	}
+
+	msg := "payout created; payment processing is not connected"
+	if s.cfg.SimulatePayments {
+		go s.simulatePayment(payoutID)
+		msg = "payout created; payment will be simulated (test deployment)"
+	}
+	log.Printf("payout %s for user %s: $%.2f", payoutID, req.UserId, req.AmountUsd)
+	return &pb.PayoutResponse{PayoutId: payoutID, Status: "pending", Message: msg, EstimatedDays: 3}, nil
+}
+
+func (s *server) simulatePayment(payoutID string) {
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE payouts SET status = 'processing', processed_at = now() WHERE payout_id = $1`, payoutID); err != nil {
+		log.Printf("payout %s: %v", payoutID, err)
+		return
+	}
+	time.Sleep(s.cfg.SimulationDelay)
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE payouts SET status = 'completed', completed_at = now(), external_transaction_id = $2
+		WHERE payout_id = $1`, payoutID, "simulated-"+payoutID); err != nil {
+		log.Printf("payout %s: %v", payoutID, err)
+		s.db.ExecContext(ctx, `UPDATE payouts SET status = 'failed', failure_reason = $2 WHERE payout_id = $1`,
+			payoutID, err.Error())
 	}
 }
 
-// gRPC message types
-type CalculateEarningsRequest struct {
-	PeerId string
-	Month  int32
-	Year   int32
+func (s *server) GetPayoutHistory(ctx context.Context, req *pb.PayoutHistoryRequest) (*pb.PayoutHistoryResponse, error) {
+	if !common.IsUUID(req.UserId) {
+		return nil, status.Error(codes.InvalidArgument, "user_id must be a UUID")
+	}
+	limit := req.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT payout_id, amount_usd, payment_method, status, created_at, completed_at
+		FROM payouts WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`, req.UserId, limit)
+	if err != nil {
+		return nil, grpcErr(err, "payout history")
+	}
+	defer rows.Close()
+	out := &pb.PayoutHistoryResponse{}
+	for rows.Next() {
+		var p pb.PayoutRecord
+		var created time.Time
+		var completed sql.NullTime
+		if err := rows.Scan(&p.PayoutId, &p.AmountUsd, &p.PaymentMethod, &p.Status, &created, &completed); err != nil {
+			return nil, grpcErr(err, "payout history")
+		}
+		p.CreatedAt, p.CompletedAt = created.Unix(), common.Unix(completed)
+		out.Payouts = append(out.Payouts, &p)
+	}
+	out.Total = int32(len(out.Payouts))
+	return out, grpcErr(rows.Err(), "payout history")
 }
 
-type EarningsResponse struct {
-	EarningId         string
-	PeerId            string
-	StorageEarnings   float64
-	BandwidthEarnings float64
-	UptimeBonus       float64
-	TotalEarnings     float64
-	Month             int32
-	Year              int32
+var paymentMethods = map[string]bool{"paypal": true, "bank": true, "crypto": true, "gift_card": true, "platform_credit": true}
+
+func (s *server) UpdatePaymentMethod(ctx context.Context, req *pb.UpdatePaymentRequest) (*pb.UpdatePaymentResponse, error) {
+	if !common.IsUUID(req.UserId) {
+		return nil, status.Error(codes.InvalidArgument, "user_id must be a UUID")
+	}
+	if !paymentMethods[req.PaymentMethod] {
+		return nil, status.Error(codes.InvalidArgument, "payment_method must be paypal, bank, crypto, gift_card or platform_credit")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE users SET payment_method = $1, payment_email = $2, payment_address = $3, updated_at = now()
+		WHERE user_id = $4`, req.PaymentMethod, common.NullIfEmpty(req.PaymentEmail),
+		common.NullIfEmpty(req.PaymentAddress), req.UserId)
+	if err != nil {
+		return nil, grpcErr(err, "update payment method")
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, status.Error(codes.NotFound, "user not found")
+	}
+	return &pb.UpdatePaymentResponse{Success: true, Message: "payment method updated"}, nil
 }
 
-type PayoutRequest struct {
-	PeerId string
-	Amount float64
+// billPreviousMonth bills every peer that was active last month and has no
+// earnings row for it yet. It runs hourly, so a missed day or a restart does
+// not skip a month, and the unique (peer_id, period_start) key makes reruns
+// harmless.
+func (s *server) billPreviousMonth(ctx context.Context) {
+	now := time.Now().UTC()
+	start := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -1, 0)
+	end := start.AddDate(0, 1, 0)
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT p.peer_id FROM peers p
+		WHERE NOT EXISTS (SELECT 1 FROM earnings e WHERE e.peer_id = p.peer_id AND e.period_start = $1)
+		  AND (p.last_seen_at >= $1::TIMESTAMP OR EXISTS (
+		       SELECT 1 FROM shards s WHERE s.peer_id = p.peer_id
+		         AND s.stored_at < $2::TIMESTAMP AND COALESCE(s.removed_at, $2::TIMESTAMP) > $1::TIMESTAMP))`,
+		start, end)
+	if err != nil {
+		log.Printf("billing: find peers: %v", err)
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+
+	for _, id := range ids {
+		if _, err := s.CalculateEarnings(ctx, &pb.CalculateEarningsRequest{
+			PeerId: id, Year: int32(start.Year()), Month: int32(start.Month())}); err != nil {
+			log.Printf("billing %s for %s: %v", start.Format("2006-01"), id, err)
+		}
+	}
+	if len(ids) > 0 {
+		log.Printf("billed %d peers for %s", len(ids), start.Format("2006-01"))
+	}
 }
 
-type PayoutResponse struct {
-	PayoutId      string
-	Status        string
-	Message       string
-	EstimatedDays int32
+func grpcErr(err error, what string) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	return status.Errorf(codes.Internal, "%s: %v", what, err)
 }
 
-type PayoutHistoryRequest struct {
-	PeerId string
-	Limit  int32
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
-type PayoutHistoryResponse struct {
-	Payouts []*PayoutRecord
-	Total   int32
-}
-
-type PayoutRecord struct {
-	PayoutId      string
-	Amount        float64
-	PaymentMethod string
-	Status        string
-	InitiatedAt   int64
-	CompletedAt   int64
-}
-
-type UpdatePaymentRequest struct {
-	PeerId         string
-	PaymentMethod  string
-	PaymentDetails string
-}
-
-type UpdatePaymentResponse struct {
-	Success bool
-	Message string
+func minf(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func main() {
-	log.Println("Starting Billing Service...")
+	ctx, stop := common.SignalContext()
+	defer stop()
 
-	config := loadConfig()
-
-	// Connect to database
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		config.DBHost, config.DBPort, config.DBUser, config.DBPassword, config.DBName)
-
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
-	}
+	cfg := loadConfig()
+	db := common.MustOpenDB(ctx, requiredSchema)
 	defer db.Close()
 
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
+	s := &server{db: db, cfg: cfg}
+	if cfg.RunBackground {
+		go common.RunEvery(ctx, "monthly-billing", cfg.CheckInterval, s.billPreviousMonth)
 	}
-
-	log.Println("Connected to database successfully")
-
-	// Create server
-	server := &BillingServiceServer{
-		db:     db,
-		config: config,
-	}
-
-	// Start background jobs
-	go server.runMonthlyBilling()
-
-	// Create gRPC server
-	lis, err := net.Listen("tcp", ":"+config.GRPCPort)
-	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
-	}
-
-	grpcServer := grpc.NewServer()
-	reflection.Register(grpcServer)
-
-	log.Printf("Billing Service listening on port %s", config.GRPCPort)
-
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
-	}
+	common.ServeGRPC(ctx, "billing-service", cfg.GRPCPort, func(g *grpc.Server) {
+		pb.RegisterBillingServiceServer(g, s)
+	})
 }

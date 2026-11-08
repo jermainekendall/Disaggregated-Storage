@@ -1,5 +1,6 @@
----
-# Replication Worker - Adaptive replication based on access patterns
+# replication-worker
+# Test deployment: one replica. Background jobs are safe to scale (they claim
+# work atomically), but one pod per service is plenty for a test cluster.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,9 +8,9 @@ metadata:
   namespace: orchestrator
   labels:
     app: replication-worker
-    tier: worker
+    tier: service
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: replication-worker
@@ -17,53 +18,33 @@ spec:
     metadata:
       labels:
         app: replication-worker
-        tier: worker
+        tier: service
     spec:
-      serviceAccountName: replication-worker
+      serviceAccountName: worker-sa
       containers:
       - name: replication-worker
-        image: replication-worker:v1.0.0
-        imagePullPolicy: IfNotPresent
+        image: orchestrator/replication-worker:dev
+        imagePullPolicy: Never   # install.sh imports the image into containerd
+        envFrom:
+        - configMapRef:
+            name: orchestrator-config
         env:
-        - name: WORKER_TYPE
-          value: "replication"
+        - name: SERVICE_NAME
+          value: "replication-worker"
         - name: POLL_INTERVAL_SECONDS
           value: "300"
         - name: BATCH_SIZE
           value: "10"
-        - name: HOT_TIER_THRESHOLD_ACCESSES
+        - name: HOT_TIER_THRESHOLD
           value: "100"
-        - name: WARM_TIER_THRESHOLD_ACCESSES
+        - name: WARM_TIER_THRESHOLD
           value: "10"
-        - name: MAX_REPLICATION_FACTOR
-          value: "28"
-        - name: LOG_LEVEL
-          value: "info"
-        envFrom:
-        - configMapRef:
-            name: orchestrator-config
-        - secretRef:
-            name: database-credentials
+        - name: ACCESS_WINDOW_DAYS
+          value: "30"
         resources:
           requests:
-            cpu: 200m
-            memory: 256Mi
+            cpu: 50m
+            memory: 64Mi
           limits:
             cpu: 500m
-            memory: 512Mi
-        livenessProbe:
-          exec:
-            command: ["/bin/sh", "-c", "ps aux | grep replication-worker | grep -v grep"]
-          initialDelaySeconds: 30
-          periodSeconds: 60
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: replication-worker-pdb
-  namespace: orchestrator
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: replication-worker
+            memory: 256Mi

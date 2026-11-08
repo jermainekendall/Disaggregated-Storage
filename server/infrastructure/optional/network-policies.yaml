@@ -1,0 +1,140 @@
+# OPTIONAL network policies, not applied by install.sh.
+#
+# Flannel (the CNI install.sh sets up) does not enforce NetworkPolicy, so
+# these have no effect there. On a CNI that does (Calico, Cilium), review them
+# first: default-deny-all also blocks DNS egress, so add a rule allowing UDP/TCP
+# 53 to kube-dns, and allow the gateway to reach peer-registry, placement and
+# billing, before applying.
+# Network Policies
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: orchestrator
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-gateway
+  namespace: orchestrator
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 9090
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: placement-service
+    - podSelector:
+        matchLabels:
+          app: peer-registry
+    - podSelector:
+        matchLabels:
+          app: audit-service
+    - podSelector:
+        matchLabels:
+          app: key-metadata
+    - podSelector:
+        matchLabels:
+          app: billing-service
+  - to:
+    - podSelector:
+        matchLabels:
+          app: cockroachdb
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+  - ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-services-to-db
+  namespace: orchestrator
+spec:
+  podSelector:
+    matchLabels:
+      app: cockroachdb
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: service
+    ports:
+    - protocol: TCP
+      port: 26257
+    - protocol: TCP
+      port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-services-to-redis
+  namespace: orchestrator
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: service
+    ports:
+    - protocol: TCP
+      port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-services-to-nats
+  namespace: orchestrator
+spec:
+  podSelector:
+    matchLabels:
+      app: nats
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: service
+    - podSelector:
+        matchLabels:
+          tier: worker
+    ports:
+    - protocol: TCP
+      port: 4222
+    - protocol: TCP
+      port: 6222
+    - protocol: TCP
+      port: 8222

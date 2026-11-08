@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package keymeta;
+option go_package = "github.com/jermainekendall/disaggregated-storage/server/proto/keymeta";
+
+// KeyMetadataService stores wrapped (client-encrypted) keys. The server never
+// sees a plaintext key, and never holds recovery shares: clients split the
+// recovery secret with Shamir's scheme themselves and hand shares to holders.
+// The server records only who holds which share.
+service KeyMetadataService {
+  rpc StoreMasterKey(StoreMasterKeyRequest) returns (StoreMasterKeyResponse);
+  rpc GetMasterKey(GetMasterKeyRequest) returns (MasterKey);
+
+  rpc StoreFileKey(StoreFileKeyRequest) returns (FileKey);
+  rpc GetFileKey(GetFileKeyRequest) returns (FileKey);
+  rpc RotateFileKey(RotateFileKeyRequest) returns (FileKey);
+
+  rpc RegisterRecoveryShares(RegisterRecoveryRequest) returns (RecoveryInfo);
+  rpc GetRecoveryInfo(GetRecoveryInfoRequest) returns (RecoveryInfo);
+}
+
+message StoreMasterKeyRequest {
+  string user_id = 1;
+  bytes wrapped_master_key = 2; // master key encrypted with the device root key
+  string algorithm = 3;         // default AES-256-GCM
+}
+
+message StoreMasterKeyResponse {
+  int32 key_version = 1;
+}
+
+message GetMasterKeyRequest {
+  string user_id = 1;
+}
+
+message MasterKey {
+  string user_id = 1;
+  bytes wrapped_master_key = 2;
+  string algorithm = 3;
+  int32 key_version = 4;
+  int64 next_rotation_at = 5;
+}
+
+message StoreFileKeyRequest {
+  string file_id = 1;
+  string user_id = 2;
+  bytes wrapped_key = 3; // file key encrypted with the user's master key
+  bytes derivation_salt = 4;
+  string algorithm = 5;  // default AES-256-GCM
+}
+
+message GetFileKeyRequest {
+  string file_id = 1;
+  string user_id = 2;
+}
+
+message RotateFileKeyRequest {
+  string file_id = 1;
+  string user_id = 2;
+  bytes new_wrapped_key = 3;
+  bytes new_derivation_salt = 4;
+  string algorithm = 5;
+}
+
+message FileKey {
+  string key_id = 1;
+  string file_id = 2;
+  bytes wrapped_key = 3;
+  bytes derivation_salt = 4;
+  string algorithm = 5;
+  int32 key_version = 6;
+  int64 created_at = 7;
+  int64 rotate_after = 8;
+  // True when the key is past its rotation date. The key still works; the
+  // client should rotate it.
+  bool rotation_due = 9;
+}
+
+message ShareHolder {
+  string holder_id = 1; // user or device that holds this share
+  int32 share_index = 2;
+}
+
+message RegisterRecoveryRequest {
+  string user_id = 1;
+  int32 threshold = 2;
+  repeated ShareHolder holders = 3;
+}
+
+message GetRecoveryInfoRequest {
+  string user_id = 1;
+}
+
+message RecoveryInfo {
+  string user_id = 1;
+  int32 threshold = 2;
+  int32 total_shares = 3;
+  repeated ShareHolder holders = 4;
+}

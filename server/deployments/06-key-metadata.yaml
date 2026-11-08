@@ -1,0 +1,76 @@
+# key-metadata
+# Test deployment: one replica. Background jobs are safe to scale (they claim
+# work atomically), but one pod per service is plenty for a test cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: key-metadata
+  namespace: orchestrator
+  labels:
+    app: key-metadata
+    tier: service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: key-metadata
+  template:
+    metadata:
+      labels:
+        app: key-metadata
+        tier: service
+    spec:
+      serviceAccountName: worker-sa
+      containers:
+      - name: key-metadata
+        image: orchestrator/key-metadata:dev
+        imagePullPolicy: Never   # install.sh imports the image into containerd
+        ports:
+        - containerPort: 50055
+          name: grpc
+        envFrom:
+        - configMapRef:
+            name: orchestrator-config
+        env:
+        - name: SERVICE_NAME
+          value: "key-metadata"
+        - name: GRPC_PORT
+          value: "50055"
+        - name: KEY_ROTATION_DAYS
+          value: "365"
+        - name: RECOVERY_THRESHOLD
+          value: "3"
+        - name: RECOVERY_TOTAL_SHARES
+          value: "5"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        readinessProbe:
+          grpc:
+            port: 50055
+          periodSeconds: 10
+        livenessProbe:
+          grpc:
+            port: 50055
+          initialDelaySeconds: 10
+          periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: key-metadata
+  namespace: orchestrator
+  labels:
+    app: key-metadata
+spec:
+  type: ClusterIP
+  selector:
+    app: key-metadata
+  ports:
+  - name: grpc
+    port: 50055
+    targetPort: 50055

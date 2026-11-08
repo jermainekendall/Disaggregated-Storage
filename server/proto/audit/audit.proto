@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package audit;
+option go_package = "github.com/jermainekendall/disaggregated-storage/server/proto/audit";
+
+// AuditService checks that peers still hold the shards assigned to them.
+//
+// The server never sees shard bytes, so proofs use precomputed challenges:
+// when a shard is uploaded, the uploader picks random challenges and computes
+// expected_proof = SHA-256(challenge || shard_bytes) for each, then registers
+// them here. An audit sends one unused challenge to the holding peer, which must
+// return the same hash. A peer cannot compute it without the shard data.
+service AuditService {
+  rpc RegisterChallenges(RegisterChallengesRequest) returns (RegisterChallengesResponse);
+  rpc ChallengeAudit(ChallengeRequest) returns (ChallengeResponse);
+  rpc VerifyResponse(VerifyRequest) returns (VerifyResult);
+  // Peers poll this (e.g. alongside their heartbeat) to collect challenges.
+  rpc GetPendingAudits(PendingAuditsRequest) returns (PendingAuditsResponse);
+  rpc GetAuditHistory(AuditHistoryRequest) returns (AuditHistoryResponse);
+}
+
+message Challenge {
+  bytes challenge = 1;      // random nonce, at least 16 bytes
+  bytes expected_proof = 2; // SHA-256(challenge || shard_bytes), 32 bytes
+}
+
+message RegisterChallengesRequest {
+  string shard_id = 1;
+  repeated Challenge challenges = 2;
+}
+
+message RegisterChallengesResponse {
+  int32 stored = 1;
+  int32 unused_total = 2; // unused challenges now on file for this shard
+}
+
+message ChallengeRequest {
+  string shard_id = 1;
+}
+
+message ChallengeResponse {
+  string audit_id = 1;
+  string peer_id = 2;   // peer that must answer
+  bytes challenge = 3;
+  int64 expires_at = 4; // unix seconds
+}
+
+message PendingAuditsRequest {
+  string peer_id = 1; // server UUID
+}
+
+message PendingAudit {
+  string audit_id = 1;
+  string shard_id = 2;
+  bytes challenge = 3;
+  int64 expires_at = 4;
+}
+
+message PendingAuditsResponse {
+  repeated PendingAudit audits = 1;
+}
+
+message VerifyRequest {
+  string audit_id = 1;
+  bytes proof = 2;
+}
+
+message VerifyResult {
+  string audit_id = 1;
+  bool passed = 2;
+  string status = 3; // "passed", "failed", "timeout"
+  string message = 4;
+}
+
+message AuditHistoryRequest {
+  string peer_id = 1;
+  string shard_id = 2;
+  int32 limit = 3; // default 100, max 1000
+}
+
+message AuditRecord {
+  string audit_id = 1;
+  string shard_id = 2;
+  string peer_id = 3;
+  string status = 4;
+  int64 challenged_at = 5;
+  int64 responded_at = 6; // 0 if no response
+}
+
+message AuditHistoryResponse {
+  repeated AuditRecord audits = 1;
+  int32 total = 2;
+}

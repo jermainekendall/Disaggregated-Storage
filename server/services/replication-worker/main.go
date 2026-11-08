@@ -1,7 +1,21 @@
-// Replication Worker - Complete Production Implementation
-// Adaptive replication based on access patterns
-// File: services/replication-worker/main.go
-
+// Replication Worker: access-based tiering and extra copies for popular files.
+//
+// Every file keeps its data + parity distinct shards (the repair worker's
+// job). On top of that, warm and hot files get extra copies of their data
+// shards (shards.is_replica = true) so reads can be spread over more peers.
+// Total placements stay within MIN/MAX_REPLICATION_COUNT (14/28 by default).
+//
+// Tier comes from accesses in the last ACCESS_WINDOW_DAYS (file_access_logs),
+// not the lifetime access_count, so files move down again when they cool off:
+//
+//	>= HOT_TIER_THRESHOLD accesses  -> hot:  copies up to MAX_REPLICATION_COUNT
+//	>= WARM_TIER_THRESHOLD accesses -> warm: about half the data shards copied once
+//	otherwise                       -> cold: no extra copies
+//
+// A copy is a replication_jobs row plus a pending shard on the target peer.
+// The target peer pulls the shard from the source peer and confirms it via
+// the gateway; the job completes when the shard turns good. Surplus copies
+// are marked 'retiring' for their peer to delete.
 package main
 
 import (
@@ -9,318 +23,278 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/jermainekendall/disaggregated-storage/server/internal/common"
 )
 
-// Configuration
-type Config struct {
-	DBHost                 string
-	DBPort                 string
-	DBName                 string
-	DBUser                 string
-	DBPassword             string
-	PollInterval           time.Duration
-	BatchSize              int
-	HotTierThreshold       int
-	WarmTierThreshold      int
-	MaxReplicationFactor   int
+type config struct {
+	PollInterval      time.Duration
+	BatchSize         int
+	HotThreshold      int
+	WarmThreshold     int
+	AccessWindow      time.Duration
+	MaxPlacements     int
+	MinHealthScore    float64
+	CapacityHeadroom  float64
+	CopyTimeout       time.Duration
+	RequireChargingWF bool
 }
 
-func loadConfig() *Config {
-	return &Config{
-		DBHost:               getEnv("DB_HOST", "cockroachdb-public"),
-		DBPort:               getEnv("DB_PORT", "26257"),
-		DBName:               getEnv("DB_NAME", "orchestrator"),
-		DBUser:               getEnv("DB_USER", "root"),
-		DBPassword:           getEnv("DB_PASSWORD", ""),
-		PollInterval:         5 * time.Minute,
-		BatchSize:            10,
-		HotTierThreshold:     100, // >100 accesses/month = hot
-		WarmTierThreshold:    10,  // >10 accesses/month = warm
-		MaxReplicationFactor: 28,  // Maximum shards
+func loadConfig() config {
+	return config{
+		PollInterval:      common.EnvDuration("POLL_INTERVAL_SECONDS", 5*time.Minute),
+		BatchSize:         common.EnvInt("BATCH_SIZE", 10),
+		HotThreshold:      common.EnvInt("HOT_TIER_THRESHOLD", 100),
+		WarmThreshold:     common.EnvInt("WARM_TIER_THRESHOLD", 10),
+		AccessWindow:      time.Duration(common.EnvInt("ACCESS_WINDOW_DAYS", 30)) * 24 * time.Hour,
+		MaxPlacements:     common.EnvInt("MAX_REPLICATION_COUNT", 28),
+		MinHealthScore:    common.EnvFloat("MIN_HEALTH_SCORE", 70),
+		CapacityHeadroom:  common.EnvFloat("CAPACITY_HEADROOM", 1.2),
+		CopyTimeout:       time.Duration(common.EnvInt("COPY_TIMEOUT_HOURS", 48)) * time.Hour,
+		RequireChargingWF: common.EnvBool("COPY_REQUIRES_CHARGING_WIFI", true),
 	}
 }
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
+var requiredSchema = map[string][]string{
+	"files":            {"file_id", "storage_tier", "shard_count", "parity_shards", "status", "updated_at"},
+	"file_access_logs": {"file_id", "access_id", "accessed_at"},
+	"shards": {"shard_id", "file_id", "peer_id", "shard_index", "shard_type", "shard_size_bytes",
+		"health_status", "is_replica", "stored_at", "removed_at"},
+	"replication_jobs": {"job_id", "file_id", "source_peer_id", "target_peer_id", "target_shard_id",
+		"shard_index", "priority", "status", "requires_charging", "requires_wifi", "queued_at", "completed_at", "last_error"},
+	"peers": {"peer_id", "is_online", "health_score", "storage_free_gb", "multiaddr"},
 }
 
-// ReplicationWorker handles adaptive replication
-type ReplicationWorker struct {
-	db     *sql.DB
-	config *Config
+type worker struct {
+	db  *sql.DB
+	cfg config
 }
 
-func NewReplicationWorker(db *sql.DB, config *Config) *ReplicationWorker {
-	return &ReplicationWorker{
-		db:     db,
-		config: config,
-	}
+func interval(d time.Duration) string { return fmt.Sprintf("%d seconds", int64(d.Seconds())) }
+
+func (w *worker) cycle(ctx context.Context) {
+	w.updateTiers(ctx)
+	w.completeCopies(ctx)
+	w.reconcile(ctx)
 }
 
-// Run starts the replication worker loop
-func (w *ReplicationWorker) Run() {
-	log.Println("Replication Worker started")
-
-	ticker := time.NewTicker(w.config.PollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			w.processReplicationJobs()
-		}
-	}
-}
-
-func (w *ReplicationWorker) processReplicationJobs() {
-	ctx := context.Background()
-
-	// Process tier upgrades (cold -> warm -> hot)
-	w.processTierUpgrades(ctx)
-
-	// Process tier downgrades (hot -> warm -> cold)
-	w.processTierDowngrades(ctx)
-
-	// Process pending replication jobs
-	w.processPendingReplications(ctx)
-}
-
-func (w *ReplicationWorker) processTierUpgrades(ctx context.Context) {
-	// Find files that should be upgraded to hot tier
-	query := `
-		SELECT f.file_id, f.tier, f.access_count
-		FROM files f
-		WHERE f.tier != 'hot'
-		  AND f.access_count >= $1
-		LIMIT $2
-	`
-
-	rows, err := w.db.QueryContext(ctx, query, w.config.HotTierThreshold, w.config.BatchSize)
+// updateTiers sets storage_tier from recent accesses, in both directions.
+func (w *worker) updateTiers(ctx context.Context) {
+	rows, err := w.db.QueryContext(ctx, `
+		UPDATE files f SET storage_tier = t.tier, updated_at = now()
+		FROM (
+			SELECT f2.file_id,
+			       CASE WHEN count(l.access_id) >= $1 THEN 'hot'
+			            WHEN count(l.access_id) >= $2 THEN 'warm'
+			            ELSE 'cold' END AS tier
+			FROM files f2
+			LEFT JOIN file_access_logs l ON l.file_id = f2.file_id AND l.accessed_at > now() - $3::INTERVAL
+			WHERE f2.status IN ('active', 'degraded')
+			GROUP BY f2.file_id
+		) t
+		WHERE f.file_id = t.file_id AND f.storage_tier != t.tier
+		RETURNING f.file_id, t.tier`,
+		w.cfg.HotThreshold, w.cfg.WarmThreshold, interval(w.cfg.AccessWindow))
 	if err != nil {
-		log.Printf("Error querying tier upgrades: %v", err)
+		log.Printf("update tiers: %v", err)
 		return
 	}
 	defer rows.Close()
-
-	count := 0
 	for rows.Next() {
-		var fileID, currentTier string
-		var accessCount int
-
-		if err := rows.Scan(&fileID, &currentTier, &accessCount); err != nil {
-			continue
+		var id, tier string
+		if rows.Scan(&id, &tier) == nil {
+			log.Printf("file %s moved to %s tier", id, tier)
 		}
-
-		log.Printf("Upgrading file %s from %s to hot tier (access count: %d)",
-			fileID, currentTier, accessCount)
-
-		// Upgrade to hot tier
-		err = w.changeTier(ctx, fileID, "hot", 28) // Max replication
-		if err != nil {
-			log.Printf("Error upgrading file %s: %v", fileID, err)
-			continue
-		}
-
-		count++
-	}
-
-	if count > 0 {
-		log.Printf("Upgraded %d files to hot tier", count)
 	}
 }
 
-func (w *ReplicationWorker) processTierDowngrades(ctx context.Context) {
-	// Find files that should be downgraded to cold tier
-	query := `
-		SELECT f.file_id, f.tier, f.access_count, f.last_accessed_at
-		FROM files f
-		WHERE f.tier = 'hot'
-		  AND f.access_count < $1
-		  AND f.last_accessed_at < $2
-		LIMIT $3
-	`
-
-	cutoff := time.Now().AddDate(0, -1, 0) // 30 days ago
-
-	rows, err := w.db.QueryContext(ctx, query, w.config.WarmTierThreshold, cutoff, w.config.BatchSize)
+// completeCopies closes jobs whose target shard was confirmed, and gives up
+// on copies that were never confirmed.
+func (w *worker) completeCopies(ctx context.Context) {
+	if _, err := w.db.ExecContext(ctx, `
+		UPDATE replication_jobs SET status = 'completed', completed_at = now()
+		WHERE status = 'queued'
+		  AND target_shard_id IN (SELECT shard_id FROM shards WHERE health_status = 'good')`); err != nil {
+		log.Printf("complete copies: %v", err)
+	}
+	rows, err := w.db.QueryContext(ctx, `
+		UPDATE replication_jobs SET status = 'failed', completed_at = now(), last_error = 'copy not confirmed in time'
+		WHERE status = 'queued' AND queued_at < now() - $1::INTERVAL
+		RETURNING target_shard_id`, interval(w.cfg.CopyTimeout))
 	if err != nil {
-		log.Printf("Error querying tier downgrades: %v", err)
+		log.Printf("expire copies: %v", err)
 		return
 	}
-	defer rows.Close()
-
-	count := 0
+	var stale []string
 	for rows.Next() {
-		var fileID, currentTier string
-		var accessCount int
-		var lastAccessed time.Time
-
-		if err := rows.Scan(&fileID, &currentTier, &accessCount, &lastAccessed); err != nil {
-			continue
+		var id sql.NullString
+		if rows.Scan(&id) == nil && id.Valid {
+			stale = append(stale, id.String)
 		}
-
-		log.Printf("Downgrading file %s from %s to cold tier (access count: %d, last access: %s)",
-			fileID, currentTier, accessCount, lastAccessed.Format("2006-01-02"))
-
-		// Downgrade to cold tier
-		err = w.changeTier(ctx, fileID, "cold", 14) // Minimum replication
-		if err != nil {
-			log.Printf("Error downgrading file %s: %v", fileID, err)
-			continue
-		}
-
-		count++
 	}
-
-	if count > 0 {
-		log.Printf("Downgraded %d files to cold tier", count)
+	rows.Close()
+	for _, id := range stale {
+		w.db.ExecContext(ctx, `
+			UPDATE shards SET health_status = 'missing', removed_at = now(), updated_at = now()
+			WHERE shard_id = $1 AND health_status = 'pending'`, id)
 	}
 }
 
-func (w *ReplicationWorker) processPendingReplications(ctx context.Context) {
-	// Find pending replication jobs
-	query := `
-		SELECT rj.job_id, rj.file_id, rj.target_replicas, rj.current_replicas
-		FROM replication_jobs rj
-		WHERE rj.status = 'pending'
-		LIMIT $1
-	`
-
-	rows, err := w.db.QueryContext(ctx, query, w.config.BatchSize)
-	if err != nil {
-		log.Printf("Error querying replication jobs: %v", err)
-		return
-	}
-	defer rows.Close()
-
-	count := 0
-	for rows.Next() {
-		var jobID, fileID string
-		var targetReplicas, currentReplicas int
-
-		if err := rows.Scan(&jobID, &fileID, &targetReplicas, &currentReplicas); err != nil {
-			continue
-		}
-
-		log.Printf("Processing replication job %s: file %s (%d -> %d replicas)",
-			jobID, fileID, currentReplicas, targetReplicas)
-
-		// Execute replication
-		err = w.executeReplication(ctx, jobID, fileID, targetReplicas, currentReplicas)
-		if err != nil {
-			log.Printf("Error executing replication: %v", err)
-			continue
-		}
-
-		count++
-	}
-
-	if count > 0 {
-		log.Printf("Processed %d replication jobs", count)
-	}
-}
-
-func (w *ReplicationWorker) changeTier(ctx context.Context, fileID, newTier string, targetReplicas int) error {
-	// Update file tier
-	_, err := w.db.ExecContext(ctx,
-		"UPDATE files SET tier = $1, updated_at = $2 WHERE file_id = $3",
-		newTier, time.Now(), fileID,
-	)
-	if err != nil {
-		return err
-	}
-
-	// Get current replica count
-	var currentReplicas int
-	err = w.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM shard_locations sl
-		 JOIN shards s ON sl.shard_id = s.shard_id
-		 WHERE s.file_id = $1 AND sl.status = 'active'`,
-		fileID,
-	).Scan(&currentReplicas)
-
-	if err != nil {
-		return err
-	}
-
-	// Create replication job if needed
-	if currentReplicas != targetReplicas {
-		_, err = w.db.ExecContext(ctx,
-			`INSERT INTO replication_jobs (file_id, target_replicas, current_replicas, status, created_at)
-			 VALUES ($1, $2, $3, 'pending', $4)`,
-			fileID, targetReplicas, currentReplicas, time.Now(),
+// reconcile adds or retires extra copies until each file matches its tier.
+func (w *worker) reconcile(ctx context.Context) {
+	rows, err := w.db.QueryContext(ctx, `
+		WITH counts AS (
+			SELECT f.file_id, f.storage_tier, f.shard_count, f.parity_shards,
+			       (SELECT count(*) FROM shards s WHERE s.file_id = f.file_id AND s.is_replica
+			          AND s.health_status IN ('good', 'pending', 'degraded')) AS copies
+			FROM files f WHERE f.status = 'active'
 		)
-		if err != nil {
-			return err
+		SELECT file_id, storage_tier, shard_count, parity_shards, copies FROM counts
+		WHERE copies != CASE storage_tier
+			WHEN 'hot'  THEN greatest($1 - shard_count - parity_shards, 0)
+			WHEN 'warm' THEN least(ceil(shard_count / 2.0)::INT, greatest($1 - shard_count - parity_shards, 0))
+			ELSE 0 END
+		LIMIT $2`, w.cfg.MaxPlacements, w.cfg.BatchSize)
+	if err != nil {
+		log.Printf("find files to reconcile: %v", err)
+		return
+	}
+	type fileRow struct {
+		id, tier             string
+		data, parity, copies int
+	}
+	var files []fileRow
+	for rows.Next() {
+		var f fileRow
+		if rows.Scan(&f.id, &f.tier, &f.data, &f.parity, &f.copies) == nil {
+			files = append(files, f)
 		}
 	}
+	rows.Close()
 
-	return nil
+	for _, f := range files {
+		target := targetCopies(f.tier, f.data, f.parity, w.cfg.MaxPlacements)
+		switch {
+		case f.copies < target:
+			added := w.addCopies(ctx, f.id, f.data, f.copies, target-f.copies)
+			log.Printf("file %s (%s): queued %d of %d extra copies", f.id, f.tier, added, target-f.copies)
+		case f.copies > target:
+			removed := w.retireCopies(ctx, f.id, f.copies-target)
+			log.Printf("file %s (%s): retired %d extra copies", f.id, f.tier, removed)
+		}
+	}
 }
 
-func (w *ReplicationWorker) executeReplication(ctx context.Context, jobID, fileID string, targetReplicas, currentReplicas int) error {
-	// Mark job as in-progress
-	_, err := w.db.ExecContext(ctx,
-		"UPDATE replication_jobs SET status = 'in_progress', started_at = $1 WHERE job_id = $2",
-		time.Now(), jobID,
-	)
+// targetCopies is the number of extra data-shard copies a file should have.
+func targetCopies(tier string, data, parity, maxPlacements int) int {
+	room := maxPlacements - data - parity
+	if room < 0 {
+		room = 0
+	}
+	switch tier {
+	case "hot":
+		return room
+	case "warm":
+		half := (data + 1) / 2
+		if half < room {
+			return half
+		}
+		return room
+	}
+	return 0
+}
+
+// addCopies queues n new copies, cycling through data shard indexes so the
+// copies spread evenly. Each copy goes to a peer holding nothing of the file.
+func (w *worker) addCopies(ctx context.Context, fileID string, data, existing, n int) int {
+	added := 0
+	for i := 0; i < n; i++ {
+		idx := (existing + i) % data
+		var srcPeer string
+		var size int64
+		err := w.db.QueryRowContext(ctx, `
+			SELECT s.peer_id, s.shard_size_bytes FROM shards s JOIN peers p ON p.peer_id = s.peer_id
+			WHERE s.file_id = $1 AND s.shard_index = $2 AND s.health_status = 'good' AND p.is_online
+			ORDER BY random() LIMIT 1`, fileID, idx).Scan(&srcPeer, &size)
+		if err != nil {
+			continue // no online source for this index right now
+		}
+		var target string
+		err = w.db.QueryRowContext(ctx, `
+			SELECT peer_id FROM peers p
+			WHERE is_online AND health_score >= $2 AND storage_free_gb >= $3 AND multiaddr IS NOT NULL
+			  AND NOT EXISTS (SELECT 1 FROM shards s WHERE s.file_id = $1 AND s.peer_id = p.peer_id)
+			ORDER BY random() LIMIT 1`,
+			fileID, w.cfg.MinHealthScore, float64(size)/(1<<30)*w.cfg.CapacityHeadroom).Scan(&target)
+		if err != nil {
+			break // no eligible peers left
+		}
+		err = common.RunTx(ctx, w.db, func(tx *sql.Tx) error {
+			var shardID string
+			if err := tx.QueryRowContext(ctx, `
+				INSERT INTO shards (file_id, peer_id, shard_index, shard_type, shard_size_bytes,
+				                    is_replica, health_status, stored_at)
+				VALUES ($1, $2, $3, 'data', $4, true, 'pending', now())
+				RETURNING shard_id`, fileID, target, idx, size).Scan(&shardID); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `
+				INSERT INTO replication_jobs (file_id, source_peer_id, target_peer_id, target_shard_id,
+				                              shard_index, priority, status, requires_charging, requires_wifi)
+				VALUES ($1, $2, $3, $4, $5, 'normal', 'queued', $6, $6)`,
+				fileID, srcPeer, target, shardID, idx, w.cfg.RequireChargingWF)
+			return err
+		})
+		if err != nil {
+			log.Printf("queue copy of %s/%d: %v", fileID, idx, err)
+			continue
+		}
+		added++
+	}
+	return added
+}
+
+// retireCopies marks n extra copies retiring, unconfirmed ones first, and
+// cancels their copy jobs.
+func (w *worker) retireCopies(ctx context.Context, fileID string, n int) int {
+	rows, err := w.db.QueryContext(ctx, `
+		UPDATE shards SET health_status = 'retiring', removed_at = now(), updated_at = now()
+		WHERE shard_id IN (
+			SELECT shard_id FROM shards
+			WHERE file_id = $1 AND is_replica AND health_status IN ('pending', 'degraded', 'good')
+			ORDER BY CASE health_status WHEN 'pending' THEN 0 WHEN 'degraded' THEN 1 ELSE 2 END, stored_at DESC
+			LIMIT $2)
+		RETURNING shard_id`, fileID, n)
 	if err != nil {
-		return err
+		log.Printf("retire copies of %s: %v", fileID, err)
+		return 0
 	}
-
-	if targetReplicas > currentReplicas {
-		// Scale up - add more replicas
-		needed := targetReplicas - currentReplicas
-		log.Printf("Scaling up file %s: adding %d replicas", fileID, needed)
-
-		// In production, this would trigger actual data replication
-		// For now, just update the job status
-	} else if targetReplicas < currentReplicas {
-		// Scale down - remove excess replicas
-		toRemove := currentReplicas - targetReplicas
-		log.Printf("Scaling down file %s: removing %d replicas", fileID, toRemove)
-
-		// In production, this would mark shards for deletion
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
 	}
-
-	// Mark job as completed
-	_, err = w.db.ExecContext(ctx,
-		"UPDATE replication_jobs SET status = 'completed', completed_at = $1 WHERE job_id = $2",
-		time.Now(), jobID,
-	)
-
-	return err
+	rows.Close()
+	for _, id := range ids {
+		w.db.ExecContext(ctx, `
+			UPDATE replication_jobs SET status = 'cancelled', completed_at = now()
+			WHERE target_shard_id = $1 AND status = 'queued'`, id)
+	}
+	return len(ids)
 }
 
 func main() {
-	log.Println("Starting Replication Worker...")
+	ctx, stop := common.SignalContext()
+	defer stop()
 
-	config := loadConfig()
-
-	// Connect to database
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		config.DBHost, config.DBPort, config.DBUser, config.DBPassword, config.DBName)
-
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
-	}
+	cfg := loadConfig()
+	db := common.MustOpenDB(ctx, requiredSchema)
 	defer db.Close()
 
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
-	}
-
-	log.Println("Connected to database successfully")
-
-	// Create and run worker
-	worker := NewReplicationWorker(db, config)
-	worker.Run()
+	w := &worker{db: db, cfg: cfg}
+	log.Printf("replication worker started (poll %s)", cfg.PollInterval)
+	common.RunEvery(ctx, "replication", cfg.PollInterval, w.cycle)
 }

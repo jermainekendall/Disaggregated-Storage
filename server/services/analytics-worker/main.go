@@ -1,350 +1,181 @@
-// Analytics Worker - Complete Production Implementation
-// ML predictions, usage analytics, and reporting
-// File: services/analytics-worker/main.go
-
+// Analytics Worker: churn risk, reliability scores and system statistics.
 package main
 
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
-	"math"
-	"os"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/jermainekendall/disaggregated-storage/server/internal/common"
 )
 
-// Configuration
-type Config struct {
-	DBHost            string
-	DBPort            string
-	DBName            string
-	DBUser            string
-	DBPassword        string
-	PollInterval      time.Duration
-	BatchSize         int
-	ChurnThreshold    float64
+type config struct {
+	PollInterval     time.Duration
+	ForecastInterval time.Duration
+	ChurnThreshold   float64
+	RetentionDays    int
 }
 
-func loadConfig() *Config {
-	return &Config{
-		DBHost:         getEnv("DB_HOST", "cockroachdb-public"),
-		DBPort:         getEnv("DB_PORT", "26257"),
-		DBName:         getEnv("DB_NAME", "orchestrator"),
-		DBUser:         getEnv("DB_USER", "root"),
-		DBPassword:     getEnv("DB_PASSWORD", ""),
-		PollInterval:   10 * time.Minute,
-		BatchSize:      1000,
-		ChurnThreshold: 0.7, // 70% probability
+func loadConfig() config {
+	return config{
+		PollInterval:     common.EnvDuration("POLL_INTERVAL_SECONDS", 10*time.Minute),
+		ForecastInterval: common.EnvDuration("FORECAST_INTERVAL", 24*time.Hour),
+		ChurnThreshold:   common.EnvFloat("CHURN_THRESHOLD", 0.7),
+		RetentionDays:    common.EnvInt("EVENT_RETENTION_DAYS", 90),
 	}
 }
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
+var requiredSchema = map[string][]string{
+	"peers": {"peer_id", "uptime_percentage", "failed_audits", "successful_audits", "health_score",
+		"first_seen_at", "last_heartbeat_at", "last_seen_at", "is_online", "churn_prediction",
+		"churn_prediction_updated_at", "reliability_score", "storage_total_gb", "storage_free_gb"},
+	"files":            {"file_id", "owner_id", "file_size_bytes", "status", "created_at"},
+	"analytics_events": {"event_type", "event_data", "created_at"},
+	"enterprise_usage": {"total_charge_usd", "calculated_at"},
 }
 
-// AnalyticsWorker handles ML predictions and analytics
-type AnalyticsWorker struct {
-	db     *sql.DB
-	config *Config
+type worker struct {
+	db  *sql.DB
+	cfg config
 }
 
-func NewAnalyticsWorker(db *sql.DB, config *Config) *AnalyticsWorker {
-	return &AnalyticsWorker{
-		db:     db,
-		config: config,
-	}
-}
-
-// Run starts the analytics worker loop
-func (w *AnalyticsWorker) Run() {
-	log.Println("Analytics Worker started")
-
-	ticker := time.NewTicker(w.config.PollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			w.processAnalytics()
-		}
-	}
-}
-
-func (w *AnalyticsWorker) processAnalytics() {
-	ctx := context.Background()
-
-	// Run various analytics tasks
+func (w *worker) cycle(ctx context.Context) {
 	w.predictChurn(ctx)
-	w.calculatePeerReliability(ctx)
-	w.generateUsageReports(ctx)
-	w.trackAnalyticsEvents(ctx)
+	w.updateReliability(ctx)
+	w.recordSystemStats(ctx)
+	w.pruneEvents(ctx)
 }
 
-// Predict which peers are likely to churn (stop providing storage)
-func (w *AnalyticsWorker) predictChurn(ctx context.Context) {
-	log.Println("Running churn prediction...")
-
-	// Get active peers
-	query := `
-		SELECT peer_id, uptime_percentage, failed_audits, successful_audits,
-		       health_score, EXTRACT(EPOCH FROM (NOW() - first_seen_at)) / 86400 AS age_days,
-		       EXTRACT(EPOCH FROM (NOW() - last_heartbeat_at)) / 3600 AS hours_since_heartbeat
-		FROM peers
-		WHERE is_online = true OR last_seen_at > NOW() - INTERVAL '7 days'
-	`
-
-	rows, err := w.db.QueryContext(ctx, query)
+// predictChurn scores every recently active peer in one statement. The score
+// adds up, capped at 1:
+//
+//	low uptime          (90 - uptime) / 100        when uptime < 90
+//	low health          (80 - health) / 200        when health < 80
+//	audit failure rate  failed / (failed + passed) x 0.5, whenever audits exist
+//	new peer            (30 - age_days) / 60       when younger than 30 days
+//	silence             min(hours_quiet / 168, 0.5) when quiet over 24 h
+func (w *worker) predictChurn(ctx context.Context) {
+	res, err := w.db.ExecContext(ctx, `
+		UPDATE peers SET churn_prediction = least(1.0::FLOAT8,
+			  CASE WHEN uptime_percentage < 90 THEN (90 - uptime_percentage::FLOAT8) / 100 ELSE 0 END
+			+ CASE WHEN health_score < 80 THEN (80 - health_score::FLOAT8) / 200 ELSE 0 END
+			+ CASE WHEN failed_audits + successful_audits > 0
+			       THEN failed_audits::FLOAT8 / (failed_audits + successful_audits)::FLOAT8 * 0.5 ELSE 0 END
+			+ CASE WHEN now() - first_seen_at < INTERVAL '30 days'
+			       THEN (30 - extract(epoch FROM now() - first_seen_at)::FLOAT8 / 86400) / 60 ELSE 0 END
+			+ CASE WHEN now() - last_heartbeat_at > INTERVAL '24 hours'
+			       THEN least(extract(epoch FROM now() - last_heartbeat_at)::FLOAT8 / 3600 / 168, 0.5) ELSE 0 END
+			), churn_prediction_updated_at = now()
+		WHERE is_online = true OR last_seen_at > now() - INTERVAL '7 days'`)
 	if err != nil {
-		log.Printf("Error querying peers for churn prediction: %v", err)
+		log.Printf("churn prediction: %v", err)
 		return
 	}
-	defer rows.Close()
-
-	count := 0
-	highRiskCount := 0
-
-	for rows.Next() {
-		var peerID string
-		var uptime, healthScore float64
-		var failedAudits, successfulAudits int
-		var ageDays, hoursSinceHeartbeat float64
-
-		if err := rows.Scan(&peerID, &uptime, &failedAudits, &successfulAudits,
-			&healthScore, &ageDays, &hoursSinceHeartbeat); err != nil {
-			continue
-		}
-
-		// Simple churn prediction model
-		churnProbability := w.calculateChurnProbability(
-			uptime, healthScore, failedAudits, successfulAudits,
-			ageDays, hoursSinceHeartbeat,
-		)
-
-		// Update prediction
-		_, err = w.db.ExecContext(ctx,
-			`UPDATE peers SET churn_prediction = $1, churn_prediction_updated_at = $2
-			 WHERE peer_id = $3`,
-			churnProbability, time.Now(), peerID,
-		)
-		if err != nil {
-			log.Printf("Error updating churn prediction: %v", err)
-			continue
-		}
-
-		if churnProbability > w.config.ChurnThreshold {
-			highRiskCount++
-			log.Printf("High churn risk for peer %s: %.2f%%", peerID, churnProbability*100)
-		}
-
-		count++
-	}
-
-	log.Printf("Churn prediction complete: %d peers analyzed, %d high-risk", count, highRiskCount)
+	n, _ := res.RowsAffected()
+	var high int
+	w.db.QueryRowContext(ctx, `SELECT count(*) FROM peers WHERE churn_prediction > $1
+		AND churn_prediction_updated_at > now() - INTERVAL '1 hour'`, w.cfg.ChurnThreshold).Scan(&high)
+	log.Printf("churn prediction: %d peers scored, %d above %.0f%%", n, high, w.cfg.ChurnThreshold*100)
 }
 
-func (w *AnalyticsWorker) calculateChurnProbability(uptime, healthScore float64,
-	failedAudits, successfulAudits int, ageDays, hoursSinceHeartbeat float64) float64 {
-
-	// Simplified ML model (in production, use proper ML library)
-	score := 0.0
-
-	// Low uptime increases churn risk
-	if uptime < 90 {
-		score += (90 - uptime) / 100.0 // 0-0.9
-	}
-
-	// Low health score increases risk
-	if healthScore < 80 {
-		score += (80 - healthScore) / 200.0 // 0-0.4
-	}
-
-	// Failed audits increase risk
-	if successfulAudits > 0 {
-		failureRate := float64(failedAudits) / float64(failedAudits+successfulAudits)
-		score += failureRate * 0.5 // 0-0.5
-	}
-
-	// New peers are more likely to churn
-	if ageDays < 30 {
-		score += (30 - ageDays) / 60.0 // 0-0.5
-	}
-
-	// Recent inactivity increases risk
-	if hoursSinceHeartbeat > 24 {
-		score += math.Min(hoursSinceHeartbeat/168.0, 0.5) // 0-0.5
-	}
-
-	// Cap at 1.0
-	if score > 1.0 {
-		score = 1.0
-	}
-
-	return score
-}
-
-// Calculate peer reliability scores
-func (w *AnalyticsWorker) calculatePeerReliability(ctx context.Context) {
-	log.Println("Calculating peer reliability scores...")
-
-	query := `
-		UPDATE peers
-		SET reliability_score = CASE
-			WHEN (successful_audits + failed_audits) = 0 THEN 1.0
-			ELSE CAST(successful_audits AS FLOAT) / (successful_audits + failed_audits)
-		END
-		WHERE is_online = true OR last_seen_at > NOW() - INTERVAL '30 days'
-	`
-
-	result, err := w.db.ExecContext(ctx, query)
+func (w *worker) updateReliability(ctx context.Context) {
+	res, err := w.db.ExecContext(ctx, `
+		UPDATE peers SET reliability_score = CASE
+			WHEN successful_audits + failed_audits = 0 THEN 1.0
+			ELSE successful_audits::DECIMAL / (successful_audits + failed_audits) END
+		WHERE is_online = true OR last_seen_at > now() - INTERVAL '30 days'`)
 	if err != nil {
-		log.Printf("Error updating reliability scores: %v", err)
+		log.Printf("reliability: %v", err)
 		return
 	}
-
-	rowsAffected, _ := result.RowsAffected()
-	log.Printf("Updated reliability scores for %d peers", rowsAffected)
+	n, _ := res.RowsAffected()
+	log.Printf("reliability scores updated for %d peers", n)
 }
 
-// Generate usage reports
-func (w *AnalyticsWorker) generateUsageReports(ctx context.Context) {
-	log.Println("Generating usage reports...")
-
-	// Calculate system-wide statistics
-	var stats struct {
-		TotalPeers        int
-		OnlinePeers       int
-		TotalFiles        int
-		TotalStorageGB    float64
-		TotalBandwidthTB  float64
-		ActiveUsers       int
-	}
-
-	// Total peers
-	w.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM peers").Scan(&stats.TotalPeers)
-
-	// Online peers
-	w.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM peers WHERE is_online = true").Scan(&stats.OnlinePeers)
-
-	// Total files
-	w.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM files").Scan(&stats.TotalFiles)
-
-	// Total storage
-	w.db.QueryRowContext(ctx,
-		"SELECT COALESCE(SUM(size_gb), 0) FROM files",
-	).Scan(&stats.TotalStorageGB)
-
-	// Active users (last 30 days)
-	w.db.QueryRowContext(ctx,
-		"SELECT COUNT(DISTINCT user_id) FROM files WHERE created_at > NOW() - INTERVAL '30 days'",
-	).Scan(&stats.ActiveUsers)
-
-	// Store analytics event
-	_, err := w.db.ExecContext(ctx,
-		`INSERT INTO analytics_events (event_type, event_data, created_at)
-		 VALUES ('system_stats', $1, $2)`,
-		fmt.Sprintf(`{"total_peers":%d,"online_peers":%d,"total_files":%d,"total_storage_gb":%.2f,"active_users":%d}`,
-			stats.TotalPeers, stats.OnlinePeers, stats.TotalFiles, stats.TotalStorageGB, stats.ActiveUsers),
-		time.Now(),
-	)
-
-	if err != nil {
-		log.Printf("Error storing analytics event: %v", err)
-		return
-	}
-
-	log.Printf("System stats: %d peers (%d online), %d files, %.2f GB storage, %d active users",
-		stats.TotalPeers, stats.OnlinePeers, stats.TotalFiles, stats.TotalStorageGB, stats.ActiveUsers)
+type systemStats struct {
+	TotalPeers     int     `json:"total_peers"`
+	OnlinePeers    int     `json:"online_peers"`
+	CapacityGB     float64 `json:"capacity_gb"`
+	FreeGB         float64 `json:"free_gb"`
+	TotalFiles     int     `json:"total_files"`
+	StoredGB       float64 `json:"stored_gb"`
+	ActiveUploader int     `json:"active_uploaders_30d"`
 }
 
-// Track and process analytics events
-func (w *AnalyticsWorker) trackAnalyticsEvents(ctx context.Context) {
-	// Clean up old analytics events (keep last 90 days)
-	cutoff := time.Now().AddDate(0, 0, -90)
-
-	result, err := w.db.ExecContext(ctx,
-		"DELETE FROM analytics_events WHERE created_at < $1",
-		cutoff,
-	)
-
+// recordSystemStats gathers the totals in one query and stores them as an event.
+func (w *worker) recordSystemStats(ctx context.Context) {
+	var s systemStats
+	err := w.db.QueryRowContext(ctx, `
+		SELECT
+		  (SELECT count(*) FROM peers),
+		  (SELECT count(*) FROM peers WHERE is_online),
+		  (SELECT COALESCE(sum(storage_total_gb), 0)::FLOAT8 FROM peers),
+		  (SELECT COALESCE(sum(storage_free_gb), 0)::FLOAT8 FROM peers WHERE is_online),
+		  (SELECT count(*) FROM files WHERE status NOT IN ('deleting', 'deleted')),
+		  (SELECT COALESCE(sum(file_size_bytes), 0)::FLOAT8 / 1073741824 FROM files WHERE status NOT IN ('deleting', 'deleted')),
+		  (SELECT count(DISTINCT owner_id) FROM files WHERE created_at > now() - INTERVAL '30 days')`).
+		Scan(&s.TotalPeers, &s.OnlinePeers, &s.CapacityGB, &s.FreeGB, &s.TotalFiles, &s.StoredGB, &s.ActiveUploader)
 	if err != nil {
-		log.Printf("Error cleaning old analytics events: %v", err)
+		log.Printf("system stats: %v", err)
 		return
 	}
+	w.storeEvent(ctx, "system_stats", s)
+	log.Printf("stats: %d peers (%d online), %d files, %.2f GB stored, %d active uploaders",
+		s.TotalPeers, s.OnlinePeers, s.TotalFiles, s.StoredGB, s.ActiveUploader)
+}
 
-	rowsDeleted, _ := result.RowsAffected()
-	if rowsDeleted > 0 {
-		log.Printf("Cleaned up %d old analytics events", rowsDeleted)
+// forecastRevenue projects enterprise revenue from the last three months.
+func (w *worker) forecastRevenue(ctx context.Context) {
+	var last3 float64
+	if err := w.db.QueryRowContext(ctx, `
+		SELECT COALESCE(sum(total_charge_usd), 0)::FLOAT8 FROM enterprise_usage
+		WHERE calculated_at > now() - INTERVAL '3 months'`).Scan(&last3); err != nil {
+		log.Printf("revenue forecast: %v", err)
+		return
+	}
+	monthly := last3 / 3
+	w.storeEvent(ctx, "revenue_forecast", map[string]float64{
+		"monthly_avg": monthly, "next_3_months": monthly * 3, "next_12_months": monthly * 12,
+	})
+}
+
+func (w *worker) storeEvent(ctx context.Context, kind string, data interface{}) {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("encode %s: %v", kind, err)
+		return
+	}
+	if _, err := w.db.ExecContext(ctx,
+		`INSERT INTO analytics_events (event_type, event_data) VALUES ($1, $2)`, kind, string(raw)); err != nil {
+		log.Printf("store %s: %v", kind, err)
 	}
 }
 
-// Generate revenue forecasts (simplified)
-func (w *AnalyticsWorker) forecastRevenue(ctx context.Context) {
-	log.Println("Forecasting revenue...")
-
-	// Get last 3 months revenue
-	query := `
-		SELECT COALESCE(SUM(amount), 0)
-		FROM enterprise_usage
-		WHERE created_at > NOW() - INTERVAL '3 months'
-	`
-
-	var last3MonthsRevenue float64
-	err := w.db.QueryRowContext(ctx, query).Scan(&last3MonthsRevenue)
+func (w *worker) pruneEvents(ctx context.Context) {
+	res, err := w.db.ExecContext(ctx,
+		`DELETE FROM analytics_events WHERE created_at < now() - $1::INTERVAL`,
+		fmt.Sprintf("%d days", w.cfg.RetentionDays))
 	if err != nil {
-		log.Printf("Error querying revenue: %v", err)
+		log.Printf("prune events: %v", err)
 		return
 	}
-
-	// Simple forecast: average of last 3 months
-	monthlyAverage := last3MonthsRevenue / 3.0
-	forecast3Months := monthlyAverage * 3.0
-	forecast12Months := monthlyAverage * 12.0
-
-	log.Printf("Revenue forecast: 3mo=$%.2f, 12mo=$%.2f (based on $%.2f monthly avg)",
-		forecast3Months, forecast12Months, monthlyAverage)
-
-	// Store forecast
-	_, err = w.db.ExecContext(ctx,
-		`INSERT INTO analytics_events (event_type, event_data, created_at)
-		 VALUES ('revenue_forecast', $1, $2)`,
-		fmt.Sprintf(`{"3_month":%.2f,"12_month":%.2f,"monthly_avg":%.2f}`,
-			forecast3Months, forecast12Months, monthlyAverage),
-		time.Now(),
-	)
-
-	if err != nil {
-		log.Printf("Error storing revenue forecast: %v", err)
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("pruned %d old analytics events", n)
 	}
 }
 
 func main() {
-	log.Println("Starting Analytics Worker...")
+	ctx, stop := common.SignalContext()
+	defer stop()
 
-	config := loadConfig()
-
-	// Connect to database
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		config.DBHost, config.DBPort, config.DBUser, config.DBPassword, config.DBName)
-
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
-	}
+	cfg := loadConfig()
+	db := common.MustOpenDB(ctx, requiredSchema)
 	defer db.Close()
 
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
-	}
-
-	log.Println("Connected to database successfully")
-
-	// Create and run worker
-	worker := NewAnalyticsWorker(db, config)
-	worker.Run()
+	w := &worker{db: db, cfg: cfg}
+	go common.RunEvery(ctx, "revenue-forecast", cfg.ForecastInterval, w.forecastRevenue)
+	common.RunEvery(ctx, "analytics", cfg.PollInterval, w.cycle)
 }

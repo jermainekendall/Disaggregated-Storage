@@ -17,12 +17,16 @@ Full server-side design and known gaps: `docs/SERVER_SIDE_TECHNICAL_REFERENCE.md
   (>= 5 ASNs, <= 3 shards per ASN) and timezone grouping.
 - Encryption: per-file AES-256-GCM keys; Shamir secret sharing for key escrow.
 
-## Status
+## Status (2026-11-08)
 
-- The source tree the reference describes (`production-complete/`, `server-updates/`,
-  `outputs/relay-service/`, `orchestrator-k8s/`, `peer-registry-FIXED/`) is **not yet
-  in this repository**.
-- The server side does not build yet. Fix these first: the three proto sources disagree,
-  the peer registry does not compile against the generated types, and the peer registry's
-  env getters ignore the environment. See section 12 of the reference for the full gap list
-  and section 13 for next steps.
+- Server code lives in `server/` (one Go module). Start with `server/README.md`.
+- `server/infrastructure/schema.sql` is the single source of truth for the database;
+  every service checks the columns it uses at startup.
+- `server/proto/` holds the only .proto files; regenerate stubs with `make proto`.
+- Tests: `go test ./...` (unit) and `server/test/e2e` (needs a CockroachDB, see README).
+- The Kubernetes manifests in `server/deployments/` are the single, test-sized set
+  (1 replica each, canonical ports 50051-50055). They have not yet been run on a live
+  cluster; the images were built and run with Docker Compose.
+- Many gaps in section 12 of the technical reference are fixed (proto mismatch,
+  env getters, ports, timezone, migration 001, shard locations, rate limiting,
+  relay rebuild). TLS and production auth remain out of scope for the test deployment.

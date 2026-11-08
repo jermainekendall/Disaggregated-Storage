@@ -1,0 +1,121 @@
+// libp2p Relay with Correct Connection Gater Interface
+// File: main.go
+
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/connmgr"
+	"github.com/libp2p/go-libp2p/core/control"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	"github.com/multiformats/go-multiaddr"
+)
+
+func main() {
+	port := flag.Int("port", 4001, "Listen port")
+	maxRes := flag.Int("max-reservations", 512, "Max reservations")
+	maxCirc := flag.Int("max-circuits", 256, "Max circuits")
+	ttl := flag.Duration("reservation-ttl", 2*time.Hour, "Reservation TTL")
+	flag.Parse()
+
+	log.Printf("Starting libp2p Relay v1.0.0")
+	log.Printf("Config: port=%d, max_res=%d, max_circ=%d, ttl=%s",
+		*port, *maxRes, *maxCirc, *ttl)
+
+	// Create host with connection gater
+	h, err := libp2p.New(
+		libp2p.ListenAddrStrings(
+			fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", *port),
+		),
+		libp2p.ConnectionGater(&relayConnectionGater{}),
+		libp2p.EnableNATService(),
+		libp2p.EnableAutoRelay(),
+		libp2p.EnableHolePunching(),
+	)
+	if err != nil {
+		log.Fatalf("Failed to create host: %v", err)
+	}
+	defer h.Close()
+
+	log.Printf("✓ Host created")
+	log.Printf("  Peer ID: %s", h.ID())
+	for _, addr := range h.Addrs() {
+		log.Printf("  Listening: %s/p2p/%s", addr, h.ID())
+	}
+
+	// Create relay service
+	_, err = relay.New(h,
+		relay.WithResources(relay.Resources{
+			Limit: &relay.RelayLimit{
+				Duration: *ttl,
+				Data:     1 << 20,
+			},
+			ReservationTTL:  *ttl,
+			MaxReservations: *maxRes,
+			MaxCircuits:     *maxCirc,
+			BufferSize:      4096,
+		}),
+	)
+	if err != nil {
+		log.Fatalf("Failed to create relay: %v", err)
+	}
+
+	log.Printf("✓ Relay service started")
+
+	// Metrics
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			peers := len(h.Network().Peers())
+			conns := len(h.Network().Conns())
+			log.Printf("📊 %d peers, %d connections", peers, conns)
+		}
+	}()
+
+	// Wait
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	
+	log.Println("✓ Relay running. Press Ctrl+C to stop.")
+	<-stop
+
+	log.Println("Shutting down...")
+}
+
+// relayConnectionGater implements connection gating with correct interface
+type relayConnectionGater struct{}
+
+func (g *relayConnectionGater) InterceptPeerDial(p peer.ID) bool {
+	return true
+}
+
+func (g *relayConnectionGater) InterceptAddrDial(id peer.ID, ma multiaddr.Multiaddr) bool {
+	return true
+}
+
+func (g *relayConnectionGater) InterceptAccept(addrs network.ConnMultiaddrs) bool {
+	return true
+}
+
+func (g *relayConnectionGater) InterceptSecured(dir network.Direction, id peer.ID, addrs network.ConnMultiaddrs) bool {
+	return true
+}
+
+// This is the correct signature for your libp2p version
+func (g *relayConnectionGater) InterceptUpgraded(conn network.Conn) (bool, control.DisconnectReason) {
+	return true, 0
+}
+
+// Ensure interface is implemented
+var _ connmgr.ConnectionGater = (*relayConnectionGater)(nil)

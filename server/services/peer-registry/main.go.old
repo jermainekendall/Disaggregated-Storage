@@ -1,0 +1,355 @@
+// Peer Registry Service - Complete Fresh Implementation
+// File: main.go
+
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"time"
+
+	_ "github.com/lib/pq"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
+	
+	pb "github.com/orchestrator/peer-registry/proto/peer"
+)
+
+type Config struct {
+	DBHost           string
+	DBPort           string
+	DBName           string
+	DBUser           string
+	DBPassword       string
+	GRPCPort         string
+	HeartbeatTimeout int
+}
+
+func loadConfig() *Config {
+	return &Config{
+		DBHost:           getEnv("DB_HOST", "cockroachdb-public"),
+		DBPort:           getEnv("DB_PORT", "26257"),
+		DBName:           getEnv("DB_NAME", "orchestrator"),
+		DBUser:           getEnv("DB_USER", "root"),
+		DBPassword:       getEnv("DB_PASSWORD", ""),
+		GRPCPort:         getEnv("GRPC_PORT", "50051"),
+		HeartbeatTimeout: 900, // 15 minutes
+	}
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+type PeerRegistryServer struct {
+	pb.UnimplementedPeerRegistryServer
+	db     *sql.DB
+	config *Config
+}
+
+// RegisterPeer registers or updates a peer
+func (s *Server) RegisterPeer(ctx context.Context, req *pb.RegisterPeerRequest) (*pb.RegisterPeerResponse, error) {
+	log.Printf("Registering peer: %s (libp2p: %s)", req.PeerId, req.Libp2PPeerId)
+	
+	// Validate libp2p peer ID (NEW)
+	if req.Libp2PPeerId == "" {
+		log.Printf("Warning: Peer %s registered without libp2p_peer_id", req.PeerId)
+	}
+	
+	// Upsert peer
+	query := `
+		INSERT INTO peers (
+			peer_id, 
+			libp2p_peer_id,     -- NEW
+			multiaddr,          -- NEW
+			multiaddrs,         -- NEW
+			ip_address, 
+			port, 
+			total_capacity_bytes, 
+			available_capacity_bytes,
+			region, 
+			asn, 
+			version, 
+			last_heartbeat, 
+			is_active
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), true)
+		ON CONFLICT (peer_id) 
+		DO UPDATE SET
+			libp2p_peer_id = EXCLUDED.libp2p_peer_id,        -- NEW
+			multiaddr = EXCLUDED.multiaddr,                  -- NEW
+			multiaddrs = EXCLUDED.multiaddrs,                -- NEW
+			ip_address = EXCLUDED.ip_address,
+			port = EXCLUDED.port,
+			total_capacity_bytes = EXCLUDED.total_capacity_bytes,
+			available_capacity_bytes = EXCLUDED.available_capacity_bytes,
+			region = EXCLUDED.region,
+			asn = EXCLUDED.asn,
+			version = EXCLUDED.version,
+			last_heartbeat = NOW(),
+			is_active = true
+		RETURNING peer_id
+	`
+	
+	var peerID string
+	err := s.db.QueryRowContext(
+		ctx,
+		query,
+		req.PeerId,
+		req.Libp2PPeerId,              // NEW
+		req.Multiaddr,                 // NEW
+		pq.Array(req.Multiaddrs),      // NEW (requires "github.com/lib/pq")
+		req.IpAddress,
+		req.Port,
+		req.TotalCapacityBytes,
+		req.AvailableCapacityBytes,
+		req.Region,
+		req.Asn,
+		req.Version,
+	).Scan(&peerID)
+	
+	if err != nil {
+		log.Printf("Failed to register peer: %v", err)
+		return &pb.RegisterPeerResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to register peer: %v", err),
+		}, nil
+	}
+	
+	log.Printf("✓ Peer registered: %s", peerID)
+	
+	return &pb.RegisterPeerResponse{
+		Success: true,
+		Message: "Peer registered successfully",
+	}, nil
+}
+
+// Heartbeat processes heartbeat from a peer
+func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	query := `
+		UPDATE peers 
+		SET 
+			available_capacity_bytes = $2,
+			multiaddrs = $3,          -- NEW
+			last_heartbeat = NOW(),
+			is_active = true
+		WHERE peer_id = $1
+		RETURNING peer_id
+	`
+	
+	var peerID string
+	err := s.db.QueryRowContext(
+		ctx,
+		query,
+		req.PeerId,
+		req.AvailableCapacityBytes,
+		pq.Array(req.Multiaddrs),    
+	).Scan(&peerID)
+	
+	if err == sql.ErrNoRows {
+		return &pb.HeartbeatResponse{
+			Success: false,
+			Message: "Peer not found - please register first",
+		}, nil
+	}
+	
+	if err != nil {
+		return &pb.HeartbeatResponse{
+			Success: false,
+			Message: fmt.Sprintf("Heartbeat failed: %v", err),
+		}, nil
+	}
+	
+	return &pb.HeartbeatResponse{
+		Success: true,
+		Message: "Heartbeat received",
+	}, nil
+}
+
+// GetPeer retrieves peer information
+func (s *PeerRegistryServer) GetPeer(ctx context.Context, req *pb.PeerRequest) (*pb.PeerInfo, error) {
+	log.Printf("GetPeer called for: %s", req.PeerId)
+
+	query := `
+		SELECT peer_id, asn, region, storage_total_gb, storage_free_gb,
+		       health_score, last_heartbeat_at, is_online
+		FROM peers
+		WHERE peer_id = $1
+	`
+
+	var info pb.PeerInfo
+	var lastHeartbeat time.Time
+	var online bool
+	var totalGB, freeGB int64
+
+	err := s.db.QueryRowContext(ctx, query, req.PeerId).Scan(
+		&info.PeerId, &info.Asn, &info.Region,
+		&totalGB, &freeGB,
+		&info.HealthScore, &lastHeartbeat, &online,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, status.Errorf(codes.NotFound, "peer not found")
+	} else if err != nil {
+		return nil, status.Errorf(codes.Internal, "database error: %v", err)
+	}
+
+	info.TotalCapacityBytes = totalGB * 1073741824
+	info.AvailableCapacityBytes = freeGB * 1073741824
+	info.LastHeartbeat = lastHeartbeat.Unix()
+	
+	if online {
+		info.Status = "active"
+	} else {
+		info.Status = "inactive"
+	}
+
+	return &info, nil
+}
+
+// ListPeers retrieves list of peers
+func (s *PeerRegistryServer) ListPeers(ctx context.Context, req *pb.ListPeersRequest) (*pb.PeerList, error) {
+	log.Printf("ListPeers called, limit: %d, status: %s", req.Limit, req.Status)
+
+	limit := req.Limit
+	if limit == 0 || limit > 1000 {
+		limit = 100
+	}
+
+	query := `
+		SELECT peer_id, asn, region, storage_total_gb, storage_free_gb,
+		       health_score, last_heartbeat_at, is_online
+		FROM peers
+		WHERE 1=1
+	`
+
+	if req.Status == "active" {
+		query += " AND is_online = true"
+	} else if req.Status == "inactive" {
+		query += " AND is_online = false"
+	}
+
+	query += " ORDER BY last_heartbeat_at DESC LIMIT $1"
+
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "query failed: %v", err)
+	}
+	defer rows.Close()
+
+	var peers []*pb.PeerInfo
+	for rows.Next() {
+		var info pb.PeerInfo
+		var lastHeartbeat time.Time
+		var online bool
+		var totalGB, freeGB int64
+
+		err := rows.Scan(
+			&info.PeerId, &info.Asn, &info.Region,
+			&totalGB, &freeGB,
+			&info.HealthScore, &lastHeartbeat, &online,
+		)
+		if err != nil {
+			continue
+		}
+
+		info.TotalCapacityBytes = totalGB * 1073741824
+		info.AvailableCapacityBytes = freeGB * 1073741824
+		info.LastHeartbeat = lastHeartbeat.Unix()
+		
+		if online {
+			info.Status = "active"
+		} else {
+			info.Status = "inactive"
+		}
+
+		peers = append(peers, &info)
+	}
+
+	return &pb.PeerList{
+		Peers: peers,
+		Total: int32(len(peers)),
+	}, nil
+}
+
+// Background job to mark inactive peers
+func (s *PeerRegistryServer) runInactivePeerMarker() {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		timeout := time.Now().Add(-time.Duration(s.config.HeartbeatTimeout) * time.Second)
+		
+		query := `
+			UPDATE peers 
+			SET is_online = false 
+			WHERE last_heartbeat_at < $1 AND is_online = true
+		`
+		
+		result, err := s.db.ExecContext(context.Background(), query, timeout)
+		if err != nil {
+			log.Printf("Error marking inactive peers: %v", err)
+			continue
+		}
+		
+		count, _ := result.RowsAffected()
+		if count > 0 {
+			log.Printf("Marked %d peers as inactive", count)
+		}
+	}
+}
+
+func main() {
+	log.Println("Starting Peer Registry Service...")
+
+	config := loadConfig()
+
+	// Connect to database
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		config.DBHost, config.DBPort, config.DBUser, config.DBPassword, config.DBName)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		log.Fatalf("Failed to ping database: %v", err)
+	}
+
+	log.Println("Connected to database successfully")
+
+	// Create server
+	server := &PeerRegistryServer{
+		db:     db,
+		config: config,
+	}
+
+	// Start background jobs
+	go server.runInactivePeerMarker()
+
+	// Create gRPC server
+	lis, err := net.Listen("tcp", ":"+config.GRPCPort)
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterPeerRegistryServer(grpcServer, server)
+	reflection.Register(grpcServer)
+
+	log.Printf("Peer Registry Service listening on port %s", config.GRPCPort)
+
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatalf("Failed to serve: %v", err)
+	}
+}

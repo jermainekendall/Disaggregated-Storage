@@ -1,0 +1,201 @@
+# CockroachDB StatefulSet (CORRECTED)
+# File: infrastructure/01-cockroachdb.yaml
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cockroachdb-public
+  namespace: orchestrator
+  labels:
+    app: cockroachdb
+spec:
+  ports:
+  - port: 26257
+    targetPort: 26257
+    name: grpc
+  - port: 8080
+    targetPort: 8080
+    name: http
+  selector:
+    app: cockroachdb
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cockroachdb
+  namespace: orchestrator
+  labels:
+    app: cockroachdb
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "_status/vars"
+    prometheus.io/port: "8080"
+spec:
+  ports:
+  - port: 26257
+    targetPort: 26257
+    name: grpc
+  - port: 8080
+    targetPort: 8080
+    name: http
+  clusterIP: None
+  selector:
+    app: cockroachdb
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cockroachdb-budget
+  namespace: orchestrator
+spec:
+  selector:
+    matchLabels:
+      app: cockroachdb
+  maxUnavailable: 1
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cockroachdb
+  namespace: orchestrator
+spec:
+  serviceName: "cockroachdb"
+  replicas: 1  # Changed to 1 for testing (was 3)
+  selector:
+    matchLabels:
+      app: cockroachdb
+  template:
+    metadata:
+      labels:
+        app: cockroachdb
+        tier: database
+    spec:
+      # FIXED: Changed to "preferred" for single-node compatibility
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - cockroachdb
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: cockroachdb
+        image: cockroachdb/cockroach:v23.1.13
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        ports:
+        - containerPort: 26257
+          name: grpc
+        - containerPort: 8080
+          name: http
+        livenessProbe:
+          httpGet:
+            path: "/health"
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: "/health?ready=1"
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 2
+        volumeMounts:
+        - name: datadir
+          mountPath: /cockroach/cockroach-data
+        env:
+        - name: COCKROACH_CHANNEL
+          value: kubernetes-insecure
+        command:
+          - "/bin/bash"
+          - "-ecx"
+          - |
+            exec /cockroach/cockroach start \
+            --logtostderr \
+            --insecure \
+            --advertise-host $(hostname -f) \
+            --http-addr 0.0.0.0 \
+            --join cockroachdb-0.cockroachdb.orchestrator.svc.cluster.local:26257 \
+            --cache 25% \
+            --max-sql-memory 25%
+      terminationGracePeriodSeconds: 60
+      # FIXED: Removed conflicting volumes section - StatefulSet uses volumeClaimTemplates
+  volumeClaimTemplates:
+  - metadata:
+      name: datadir
+    spec:
+      accessModes:
+        - "ReadWriteOnce"
+      resources:
+        requests:
+          storage: 20Gi  # Reduced from 100Gi for testing
+      storageClassName: fast-ssd
+
+---
+# Job to initialize the cluster (run once)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cockroachdb-init
+  namespace: orchestrator
+spec:
+  ttlSecondsAfterFinished: 300  # Auto-cleanup after 5 minutes
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: cockroach-init
+        image: cockroachdb/cockroach:v23.1.13
+        imagePullPolicy: IfNotPresent
+        command:
+          - "/bin/bash"
+          - "-ecx"
+          - |
+            # Wait for CockroachDB pod to be up (check HTTP health, not SQL)
+            echo "Waiting for CockroachDB pod to be up..."
+            for i in {1..60}; do
+              if curl -f http://cockroachdb-0.cockroachdb.orchestrator.svc.cluster.local:8080/health 2>/dev/null; then
+                echo "CockroachDB pod is up!"
+                break
+              fi
+              echo "Attempt $i/60: Pod not ready yet, waiting..."
+              sleep 5
+            done
+            
+            # Initialize the cluster (this makes SQL available)
+            echo "Initializing CockroachDB cluster..."
+            /cockroach/cockroach init --insecure --host=cockroachdb-0.cockroachdb.orchestrator.svc.cluster.local || echo "Cluster already initialized"
+            
+            # Wait a moment for initialization to complete
+            sleep 5
+            
+            # Create database
+            echo "Creating orchestrator database..."
+            /cockroach/cockroach sql --insecure --host=cockroachdb-public --execute="CREATE DATABASE IF NOT EXISTS orchestrator;" || true
+            
+            echo "CockroachDB initialized successfully"
+
+# REMOVED: Schema job and ConfigMap
+# Apply schema manually after cluster initialization:
+# kubectl cp infrastructure/schema.sql orchestrator/cockroachdb-0:/tmp/
+# kubectl exec -i cockroachdb-0 -n orchestrator -- \
+#   ./cockroach sql --insecure --database=orchestrator < /tmp/schema.sql

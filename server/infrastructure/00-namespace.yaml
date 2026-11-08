@@ -1,0 +1,337 @@
+# Kubernetes Namespace and Core Resources
+# File: infrastructure/00-namespace.yaml
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: orchestrator
+  labels:
+    app: distributed-storage
+    environment: production
+
+---
+# Resource Quotas
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: orchestrator-quota
+  namespace: orchestrator
+spec:
+  hard:
+    requests.cpu: "50"
+    requests.memory: 100Gi
+    requests.storage: 500Gi
+    persistentvolumeclaims: "20"
+    services.loadbalancers: "2"
+
+---
+# Limit Ranges
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: orchestrator-limits
+  namespace: orchestrator
+spec:
+  limits:
+  - max:
+      cpu: "4"
+      memory: 8Gi
+    min:
+      cpu: 50m
+      memory: 64Mi
+    default:
+      cpu: 500m
+      memory: 512Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    type: Container
+
+---
+# Service Accounts
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-gateway-sa
+  namespace: orchestrator
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: placement-service-sa
+  namespace: orchestrator
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: peer-registry-sa
+  namespace: orchestrator
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: audit-service-sa
+  namespace: orchestrator
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: billing-service-sa
+  namespace: orchestrator
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: worker-sa
+  namespace: orchestrator
+
+---
+# ConfigMap for shared configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestrator-config
+  namespace: orchestrator
+data:
+  # Database
+  DB_HOST: "cockroachdb-public"
+  DB_PORT: "26257"
+  DB_NAME: "orchestrator"
+  DB_SSL_MODE: "require"
+
+  # Redis
+  REDIS_HOST: "redis-master"
+  REDIS_PORT: "6379"
+
+  # NATS
+  NATS_URL: "nats://nats:4222"
+
+  # Service discovery
+  PLACEMENT_SERVICE_URL: "placement-service:50051"
+  PEER_REGISTRY_URL: "peer-registry:50052"
+  AUDIT_SERVICE_URL: "audit-service:50053"
+  KEY_METADATA_URL: "key-metadata:50054"
+  BILLING_SERVICE_URL: "billing-service:50055"
+
+  # Application settings
+  LOG_LEVEL: "info"
+  ENVIRONMENT: "production"
+
+  # Erasure coding
+  ERASURE_DATA_SHARDS: "10"
+  ERASURE_PARITY_SHARDS: "4"
+
+  # Placement algorithm
+  MIN_ASNS_PER_FILE: "5"
+  MAX_PEERS_PER_ASN: "3"
+  LOCAL_CLUSTER_SIZE: "6"
+  GLOBAL_CLUSTER_SIZE: "8"
+
+  # Health checks
+  PEER_INACTIVE_THRESHOLD_HOURS: "168"  # 7 days
+  PEER_CHURN_THRESHOLD_HOURS: "720"     # 30 days
+
+  # Billing
+  PLATFORM_REVENUE_SHARE: "0.65"
+  CONSUMER_REVENUE_SHARE: "0.35"
+  PAYOUT_MINIMUM_USD: "5.00"
+
+  # Audit
+  AUDIT_FREQUENCY_HOURS: "168"  # 7 days per shard
+
+  # Replication
+  MIN_REPLICATION_COUNT: "14"
+  MAX_REPLICATION_COUNT: "28"
+
+---
+# Secrets (these should be created via Sealed Secrets in production)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-credentials
+  namespace: orchestrator
+type: Opaque
+stringData:
+  DB_USER: "root"
+  DB_PASSWORD: "CHANGE_ME_IN_PRODUCTION"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-password
+  namespace: orchestrator
+type: Opaque
+stringData:
+  REDIS_PASSWORD: "CHANGE_ME_IN_PRODUCTION"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jwt-secret
+  namespace: orchestrator
+type: Opaque
+stringData:
+  JWT_SECRET_KEY: "CHANGE_ME_IN_PRODUCTION_USE_LONG_RANDOM_STRING"
+  JWT_EXPIRY_HOURS: "24"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: payment-credentials
+  namespace: orchestrator
+type: Opaque
+stringData:
+  STRIPE_API_KEY: "sk_live_CHANGE_ME"
+  STRIPE_WEBHOOK_SECRET: "whsec_CHANGE_ME"
+  PAYPAL_CLIENT_ID: "CHANGE_ME"
+  PAYPAL_CLIENT_SECRET: "CHANGE_ME"
+  COINBASE_API_KEY: "CHANGE_ME"
+  COINBASE_API_SECRET: "CHANGE_ME"
+
+---
+# Network Policies
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: orchestrator
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-gateway
+  namespace: orchestrator
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 9090
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: placement-service
+    - podSelector:
+        matchLabels:
+          app: peer-registry
+    - podSelector:
+        matchLabels:
+          app: audit-service
+    - podSelector:
+        matchLabels:
+          app: key-metadata
+    - podSelector:
+        matchLabels:
+          app: billing-service
+  - to:
+    - podSelector:
+        matchLabels:
+          app: cockroachdb
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+  - ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-services-to-db
+  namespace: orchestrator
+spec:
+  podSelector:
+    matchLabels:
+      app: cockroachdb
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: service
+    ports:
+    - protocol: TCP
+      port: 26257
+    - protocol: TCP
+      port: 8080
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-services-to-redis
+  namespace: orchestrator
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: service
+    ports:
+    - protocol: TCP
+      port: 6379
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-services-to-nats
+  namespace: orchestrator
+spec:
+  podSelector:
+    matchLabels:
+      app: nats
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: service
+    - podSelector:
+        matchLabels:
+          tier: worker
+    ports:
+    - protocol: TCP
+      port: 4222
+    - protocol: TCP
+      port: 6222
+    - protocol: TCP
+      port: 8222

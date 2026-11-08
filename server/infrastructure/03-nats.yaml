@@ -1,0 +1,111 @@
+---
+# NATS Messaging Service
+# Used for asynchronous communication between services
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: orchestrator
+  labels:
+    app: nats
+spec:
+  ports:
+  - port: 4222
+    targetPort: 4222
+    name: client
+  - port: 6222
+    targetPort: 6222
+    name: cluster
+  - port: 8222
+    targetPort: 8222
+    name: monitor
+  selector:
+    app: nats
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+  namespace: orchestrator
+spec:
+  serviceName: nats
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      containers:
+      - name: nats
+        image: nats:2.10-alpine
+        ports:
+        - containerPort: 4222
+          name: client
+        - containerPort: 6222
+          name: cluster
+        - containerPort: 8222
+          name: monitor
+        command:
+          - "nats-server"
+          - "--config"
+          - "/etc/nats/nats.conf"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        volumeMounts:
+        - name: nats-data
+          mountPath: /data
+        - name: config
+          mountPath: /etc/nats
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8222
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8222
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: nats-config
+  volumeClaimTemplates:
+  - metadata:
+      name: nats-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: local-path  # Use local-path provisioner
+      resources:
+        requests:
+          storage: 10Gi
+---
+# NATS ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  namespace: orchestrator
+data:
+  nats.conf: |
+    port: 4222
+    http: 8222
+    
+    jetstream {
+      store_dir: /data
+      max_memory_store: 1GB
+      max_file_store: 10GB
+    }
+    
+    max_payload: 8MB

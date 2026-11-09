@@ -162,13 +162,19 @@ k apply -f "$WORK_DIR/infrastructure/00-storage.yaml" >/dev/null
 k wait --namespace local-path-storage --for=condition=Ready pod --all --timeout=180s
 k apply -f "$WORK_DIR/infrastructure/00-namespace.yaml" >/dev/null
 
+# Earlier versions used an init Job that could never finish; remove any left over.
+k delete job cockroachdb-init -n "$NS" --ignore-not-found >/dev/null
 k apply -f "$WORK_DIR/infrastructure/01-cockroachdb.yaml" >/dev/null
-wait_exists pod/cockroachdb-0 "$NS"
-# The pod reports Ready only after the cluster is initialized, which the
-# cockroachdb-init Job does (it tolerates "already initialized").
-wait_exists job/cockroachdb-init "$NS"
-k wait --for=condition=complete job/cockroachdb-init -n "$NS" --timeout=600s
-k wait --for=condition=Ready pod/cockroachdb-0 -n "$NS" --timeout=300s
+# start-single-node initializes itself; the rollout finishes once the pod is
+# Ready (this also replaces a pod left over from an earlier manifest).
+if ! k rollout status statefulset/cockroachdb -n "$NS" --timeout=600s; then
+    log_error "CockroachDB did not become ready. Diagnostics:"
+    k get pod,pvc -n "$NS" -l app=cockroachdb -o wide || true
+    k get pvc -n "$NS" || true
+    k describe pod cockroachdb-0 -n "$NS" | sed -n '/^Events:/,$p' || true
+    k logs cockroachdb-0 -n "$NS" --tail=40 || true
+    exit 1
+fi
 log_success "CockroachDB ready"
 
 for f in 02-redis 03-nats; do

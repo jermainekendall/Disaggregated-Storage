@@ -200,8 +200,18 @@ k apply -f "$WORK_DIR/infrastructure/00-namespace.yaml" >/dev/null
 # Earlier versions used an init Job that could never finish; remove any left over.
 k delete job cockroachdb-init -n "$NS" --ignore-not-found >/dev/null
 k apply -f "$WORK_DIR/infrastructure/01-cockroachdb.yaml" >/dev/null
-# start-single-node initializes itself; the rollout finishes once the pod is
-# Ready (this also replaces a pod left over from an earlier manifest).
+# A StatefulSet never replaces a pod that is not Ready, so a pod from an
+# older, broken spec would block the rollout forever. Delete it if it is not
+# on the current revision; the StatefulSet recreates it from the new spec.
+# (The data volume is kept.)
+sleep 2
+WANT_REV=$(k get statefulset cockroachdb -n "$NS" -o jsonpath='{.status.updateRevision}')
+HAVE_REV=$(k get pod cockroachdb-0 -n "$NS" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
+if [ -n "$HAVE_REV" ] && [ -n "$WANT_REV" ] && [ "$HAVE_REV" != "$WANT_REV" ]; then
+    log_info "Replacing cockroachdb-0 (revision $HAVE_REV) with the current spec ($WANT_REV)"
+    k delete pod cockroachdb-0 -n "$NS" --wait=true >/dev/null
+fi
+# start-single-node initializes itself; the rollout finishes once the pod is Ready.
 if ! k rollout status statefulset/cockroachdb -n "$NS" --timeout=600s; then
     log_error "CockroachDB did not become ready. Diagnostics:"
     k get pod,pvc -n "$NS" -l app=cockroachdb -o wide || true

@@ -77,8 +77,11 @@ apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     apt-transport-https ca-certificates curl gnupg lsb-release git jq netcat-openbsd
 
+# The kubelet will not start while swap is on. Disable it now and on reboot.
+# fstab fields may be separated by tabs (Ubuntu 24.04's /swap.img line is).
 swapoff -a
-sed -i '/ swap / s/^\([^#].*\)$/#\1/' /etc/fstab
+sed -i -E '/^[^#].*[[:space:]]swap[[:space:]]/ s/^/#/' /etc/fstab
+systemctl mask --now swap.target >/dev/null 2>&1 || true
 
 cat > /etc/modules-load.d/k8s.conf <<EOF
 overlay
@@ -135,6 +138,21 @@ NODE_IP=$(hostname -I | awk '{print $1}')
 if [ ! -f /etc/kubernetes/admin.conf ]; then
     kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address="$NODE_IP" \
         > /tmp/kubeadm-init.log 2>&1 || { cat /tmp/kubeadm-init.log; exit 1; }
+else
+    # Existing cluster: its certificates and config are tied to the IP it was
+    # created with. If the machine's address changed (DHCP), the API server
+    # cannot come back up on its own.
+    API_IP=$(grep -m1 'server:' /etc/kubernetes/admin.conf | sed -E 's#.*https://([^:]+):.*#\1#')
+    if ! hostname -I | tr ' ' '\n' | grep -qx "$API_IP"; then
+        log_error "This cluster was created for IP $API_IP, but this machine now has: $(hostname -I)"
+        log_error "Either give the machine its old address back (a DHCP reservation for $API_IP"
+        log_error "is the easiest), or reset the cluster and re-run this script:"
+        log_error "  sudo kubeadm reset -f && sudo rm -rf /etc/cni/net.d \$HOME/.kube && sudo ./install.sh -y"
+        exit 1
+    fi
+    # After a reboot the kubelet may be in restart back-off (e.g. it found
+    # swap on); restart it now that swap is off so the control plane returns.
+    systemctl restart kubelet
 fi
 mkdir -p /root/.kube
 cp -f /etc/kubernetes/admin.conf /root/.kube/config
@@ -144,6 +162,23 @@ if [ "$CURRENT_USER" != root ]; then
     chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.kube"
 fi
 export KUBECONFIG=/root/.kube/config
+
+# Wait for the API server before using it (it takes a while after kubeadm
+# init, a kubelet restart or a reboot).
+log_info "Waiting for the Kubernetes API server..."
+for i in $(seq 60); do
+    k get --raw=/readyz >/dev/null 2>&1 && break
+    if [ "$i" -eq 60 ]; then
+        log_error "The API server at $(grep -m1 'server:' /etc/kubernetes/admin.conf | awk '{print $2}') is not answering. Diagnostics:"
+        swapon --show || true
+        systemctl --no-pager --lines=0 status kubelet || true
+        journalctl -u kubelet --no-pager -n 25 || true
+        crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a 2>/dev/null | grep -E 'kube-apiserver|etcd' || true
+        exit 1
+    fi
+    sleep 5
+done
+log_success "API server is up"
 
 # Single node: allow workloads on the control plane.
 k taint nodes --all node-role.kubernetes.io/control-plane- >/dev/null 2>&1 || true

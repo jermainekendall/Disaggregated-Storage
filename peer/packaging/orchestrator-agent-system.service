@@ -1,0 +1,60 @@
+# systemd system unit for the Orchestrator storage agent, running as the
+# dedicated `orchestrator` account. Installed by ./install.sh as
+# /etc/systemd/system/orchestrator-agent.service.
+#
+# The agent accepts data from other peers, so it is sandboxed: it cannot see
+# /home, the rest of the filesystem is read-only to it, it has no
+# capabilities and cannot gain privileges. It may write only its state
+# directory (/var/lib/orchestrator: config, identity key, shards) and
+# /run/orchestrator (its public peer ID).
+#
+#   sudo systemctl status orchestrator-agent
+#   sudo journalctl -u orchestrator-agent -f
+[Unit]
+Description=Orchestrator storage agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=orchestrator
+Group=orchestrator
+ExecStart=/usr/local/bin/orchestrator --config /var/lib/orchestrator/config.yaml run
+Restart=on-failure
+RestartSec=10
+
+StateDirectory=orchestrator
+StateDirectoryMode=0700
+RuntimeDirectory=orchestrator
+RuntimeDirectoryMode=0755
+UMask=0077
+LimitNOFILE=65536
+
+# Sandbox
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+# Netlink is needed to read interface addresses and routes.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

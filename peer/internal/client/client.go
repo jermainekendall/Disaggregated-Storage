@@ -210,13 +210,12 @@ func (c *Client) Upload(ctx context.Context, path, tier string) (UploadResult, e
 	if err != nil {
 		return res, err
 	}
-	var owner agent.State
-	identity.ReadJSON(agent.StatePath(c.cfg), &owner) // don't place shards on our own agent
+	owner := c.localAgentPeerID() // don't place shards on our own agent
 
 	plan, err := c.api.StartUpload(ctx, api.UploadRequest{
 		FileSizeBytes: res.StoredBytes, FileNameEncrypted: nameEnc,
 		MimeType:    mime.TypeByExtension(filepath.Ext(path)),
-		StorageTier: tier, OwnerPeerID: owner.PeerID,
+		StorageTier: tier, OwnerPeerID: owner,
 		IsCompressed: true, CompressionAlgorithm: "gzip", OriginalSizeBytes: res.PlainBytes,
 	})
 	if err != nil {
@@ -293,6 +292,22 @@ func (c *Client) Upload(ctx context.Context, path, tier string) (UploadResult, e
 	}
 	ok = true
 	return res, nil
+}
+
+// localAgentPeerID finds this machine's agent: in the same config directory
+// (agent run as this user) or the file published by the system service.
+func (c *Client) localAgentPeerID() string {
+	var st agent.State
+	identity.ReadJSON(agent.StatePath(c.cfg), &st)
+	if st.PeerID != "" {
+		return st.PeerID
+	}
+	if f := c.cfg.AgentPeerIDFile; f != "" {
+		if b, err := os.ReadFile(f); err == nil {
+			return strings.TrimSpace(string(b))
+		}
+	}
+	return ""
 }
 
 func (c *Client) push(ctx context.Context, h *p2p.Host, a api.Assignment, path string, size int64, sum string) error {

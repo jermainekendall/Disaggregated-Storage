@@ -4,11 +4,12 @@
 #   make test              unit tests
 #   make integration       full network test (needs TEST_DATABASE_URL, see README)
 #   make install           copy the binary to ~/.local/bin
-#   make install-service   install and start the systemd user service
+#   make install-user-service   run the agent as your own user (default is ./install.sh,
+#                          which uses a dedicated system account)
 VERSION ?= 0.1.0
 BIN     := bin/orchestrator
 
-.PHONY: build test integration install install-service
+.PHONY: build test integration install install-user-service
 
 build:
 	go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/orchestrator
@@ -22,7 +23,7 @@ integration:
 install: build
 	install -D -m 0755 $(BIN) $(HOME)/.local/bin/orchestrator
 
-install-service: install
+install-user-service: install
 	install -D -m 0644 packaging/orchestrator-agent.service $(HOME)/.config/systemd/user/orchestrator-agent.service
 	systemctl --user daemon-reload
 	systemctl --user enable --now orchestrator-agent

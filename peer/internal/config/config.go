@@ -34,6 +34,14 @@ type Config struct {
 	AnnounceLoopback bool     `yaml:"announce_loopback"` // advertise 127.0.0.1 (single-machine tests)
 	KeyPath          string   `yaml:"key_path"`          // identity key file
 
+	// The agent writes its server peer ID here (world-readable) so client
+	// commands run by other users can avoid placing shards on it. The
+	// system service sets /run/orchestrator/peer-id.
+	PeerIDFile string `yaml:"peer_id_file,omitempty"`
+	// Where client commands look for the local agent's peer ID when it is not
+	// in this config directory (the system service's file by default).
+	AgentPeerIDFile string `yaml:"agent_peer_id_file,omitempty"`
+
 	// Location reported at registration (timezone is read from the system)
 	Region string `yaml:"region"`
 	ASN    string `yaml:"asn"`
@@ -62,6 +70,7 @@ func Defaults() Config {
 		StorageGB:         10,
 		ListenPort:        4001,
 		KeyPath:           "identity.key",
+		AgentPeerIDFile:   "/run/orchestrator/peer-id",
 		Region:            "",
 		HeartbeatInterval: 5 * time.Minute, // the server marks peers offline after 15
 		PollInterval:      30 * time.Second,

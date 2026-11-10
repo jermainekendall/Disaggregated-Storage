@@ -239,6 +239,8 @@ func cmdSetup(g globals, args []string) error {
 	region := fs.String("region", "", "region label, e.g. gy-georgetown")
 	asn := fs.String("asn", "", "your ISP's AS number, e.g. AS20057 (optional)")
 	loopback := fs.Bool("loopback", false, "advertise 127.0.0.1 (several agents on one machine)")
+	clientOnly := fs.Bool("client-only", false, "configure only the server addresses (no storage or identity), for a user whose agent runs as a system service")
+	peerIDFile := fs.String("peer-id-file", "", "where the agent publishes its peer ID (system service)")
 	fs.Parse(args)
 
 	c := config.Defaults()
@@ -267,6 +269,10 @@ func cmdSetup(g globals, args []string) error {
 	if *loopback {
 		c.AnnounceLoopback = true
 	}
+	set(&c.PeerIDFile, *peerIDFile)
+	if *clientOnly {
+		*nonInteractive = *nonInteractive || (*gateway != "" && *registry != "")
+	}
 
 	if !*nonInteractive {
 		fmt.Println("Orchestrator setup. Press Enter to keep the value in brackets.")
@@ -276,6 +282,8 @@ func cmdSetup(g globals, args []string) error {
 		c.RegistryAddr = ask("Peer registry (gRPC)", orDefault(c.RegistryAddr, host+":30051"))
 		c.RelayAddr = ask("Relay address (printed at the end of server install; empty for none)", c.RelayAddr)
 		fmt.Println()
+	}
+	if !*nonInteractive && !*clientOnly {
 		fmt.Println("Storage for other people's shards:")
 		fmt.Println("  1) Use a directory on an existing filesystem")
 		fmt.Println("  2) Create a dedicated partition (not automated: create and mount it yourself, then choose 1)")
@@ -296,6 +304,13 @@ func cmdSetup(g globals, args []string) error {
 	}
 	if err := c.Validate(); err != nil {
 		return err
+	}
+	if *clientOnly {
+		if err := c.Save(g.configPath); err != nil {
+			return err
+		}
+		fmt.Printf("Saved %s (client settings only)\n", g.configPath)
+		return nil
 	}
 
 	dir := c.StorageDir
@@ -352,7 +367,8 @@ func cmdStatus(c *config.Config) error {
 	fmt.Printf("Config:        %s\n", filepath.Join(c.Dir(), "config.yaml"))
 	fmt.Printf("Gateway:       %s\n", c.GatewayURL)
 	fmt.Printf("Server peer:   %s\n", orDefault(st.PeerID, "(not registered yet; run the agent)"))
-	key, err := identity.LoadOrCreateKey(c.Resolve(c.KeyPath))
+	// Only read the key: status must not create an identity as a side effect.
+	key, err := identity.LoadKey(c.Resolve(c.KeyPath))
 	if err == nil {
 		if id, err := peerIDOf(key); err == nil {
 			fmt.Printf("libp2p ID:     %s\n", id)

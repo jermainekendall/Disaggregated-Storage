@@ -1,5 +1,5 @@
 # systemd user unit for the Orchestrator storage agent.
-# Install:  make install install-service
+# Install:  ./install.sh --user-service  (or make install install-user-service)
 # Logs:     journalctl --user -u orchestrator-agent -f
 [Unit]
 Description=Orchestrator storage agent

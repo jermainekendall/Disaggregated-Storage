@@ -48,6 +48,15 @@ func LoadOrCreateKey(path string) (crypto.PrivKey, error) {
 	return priv, f.Sync()
 }
 
+// LoadKey reads an existing identity key.
+func LoadKey(path string) (crypto.PrivKey, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return crypto.UnmarshalPrivateKey(raw)
+}
+
 // ReadJSON loads a state file into v. A missing file leaves v unchanged.
 func ReadJSON(path string, v interface{}) error {
 	raw, err := os.ReadFile(path)

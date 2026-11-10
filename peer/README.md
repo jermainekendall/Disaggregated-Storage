@@ -18,39 +18,83 @@ From this folder, as your normal user (not root):
 ./install.sh
 ```
 
+By default the storage agent runs as its own **`orchestrator` system account**,
+not as you. The agent accepts data from other peers, so it is kept away from
+your files:
+
+- **The account:** no login shell and no home directory. The agent's config,
+  identity key and stored shards live in `/var/lib/orchestrator`, readable only
+  by that account.
+- **The sandbox:** the systemd service hides `/home` from the agent, makes the
+  rest of the filesystem read-only to it, drops all capabilities and blocks
+  privilege escalation. `systemd-analyze security` rates it 1.5 ("OK", lower is
+  safer).
+- **Startup:** it starts at boot; no login is needed.
+- **Your own commands** (`login`, `upload`, `download`, ...) run as you, with
+  your settings in `~/.config/orchestrator`. The agent publishes its peer ID in
+  `/run/orchestrator/peer-id`, so your uploads never place shards on your own
+  machine.
+
 The installer:
 - installs the build tools with apt;
 - installs Go 1.24 from go.dev if needed (Ubuntu 24.04's packaged Go is too old),
   checking the published SHA-256;
-- builds `orchestrator` into `~/.local/bin`;
-- runs `orchestrator setup`;
+- builds `orchestrator` into `/usr/local/bin`;
+- creates the account and configures the agent (setup asks for the server
+  addresses and storage);
+- writes your client settings;
 - opens the agent's port in ufw if the firewall is active;
-- installs and starts the systemd user service;
-- checks that the server's gateway and registry are reachable.
+- installs and starts the `orchestrator-agent` service;
+- checks that the server is reachable.
 
-Re-run it after pulling new code: it rebuilds and restarts the agent.
+**Moving an earlier per-user install:** if this machine already ran the agent as
+your user, the installer moves its identity, peer ID and stored shards to the
+`orchestrator` account. The machine keeps its identity on the network.
 
-Setup asks for the gateway URL (e.g. `http://192.168.1.201:30080`), the
-registry address (`192.168.1.201:30051`), the relay address (printed at the end
-of the server install), the storage directory and how much space to offer. To
-skip the questions, pass the answers after `--`:
+**Storage location:** the default is `/var/lib/orchestrator/storage`. A
+directory on another disk works too, and the installer grants the sandbox write
+access to it. A directory under `/home` does not work, because the sandbox hides
+`/home`.
+
+Re-run the installer after pulling new code: it rebuilds and restarts the agent.
+To skip the questions, pass the answers after `--`:
 
 ```bash
 ./install.sh -y -- --non-interactive --gateway http://192.168.1.201:30080 --registry 192.168.1.201:30051 --relay /ip4/192.168.1.201/tcp/30001/p2p/<relay-id> --storage-gb 50
 ```
 
-Other options: `--linger` keeps the agent running while you are logged out,
-`--no-service` skips the systemd service, and `--no-setup` skips configuration.
-`./install.sh --help` lists them all.
+`./install.sh --help` lists every option. `--user-service` runs the agent as your
+own user instead (the earlier setup).
 
-Agent logs:
+**Managing the agent:**
 
 ```bash
-journalctl --user -u orchestrator-agent -f
+sudo systemctl status orchestrator-agent
 ```
 
-Without the installer (Go 1.24+ already installed), `make install` builds the
-binary and `make install-service` installs the service.
+```bash
+sudo journalctl -u orchestrator-agent -f
+```
+
+```bash
+sudo -u orchestrator orchestrator --config /var/lib/orchestrator/config.yaml status
+```
+
+To change the agent's settings:
+
+```bash
+sudo env HOME=/var/lib/orchestrator orchestrator --config /var/lib/orchestrator/config.yaml setup
+```
+
+```bash
+sudo chown -R orchestrator:orchestrator /var/lib/orchestrator
+```
+
+```bash
+sudo systemctl restart orchestrator-agent
+```
+
+Re-running `./install.sh -- <setup flags>` does the same three steps.
 
 ## Use
 
@@ -121,12 +165,17 @@ address, so peers behind NAT stay reachable.
 
 | Path | What |
 |---|---|
-| `~/.config/orchestrator/config.yaml` | settings (0600) |
-| `~/.config/orchestrator/identity.key` | libp2p identity (0600, created once) |
-| `~/.config/orchestrator/state.json` | server-assigned peer ID |
-| `~/.config/orchestrator/session.json` | login token (0600) |
-| `~/.config/orchestrator/work/` | temporary space for uploads, downloads and rebuilds |
-| `storage_dir` | shards held for others (0700; the agent refuses looser permissions) |
+| `/var/lib/orchestrator/config.yaml` | agent settings (owned by `orchestrator`, 0600) |
+| `/var/lib/orchestrator/identity.key` | agent's libp2p identity (0600, created once) |
+| `/var/lib/orchestrator/state.json` | agent's server-assigned peer ID |
+| `/var/lib/orchestrator/storage/` | shards held for others (0700; the agent refuses looser permissions) |
+| `/run/orchestrator/peer-id` | the agent's peer ID, world-readable |
+| `~/.config/orchestrator/config.yaml` | your client settings (server addresses) |
+| `~/.config/orchestrator/session.json` | your login token (0600) |
+| `~/.config/orchestrator/work/` | temporary space for your uploads and downloads |
+
+With `--user-service`, the agent's files are in `~/.config/orchestrator` and
+`~/.local/share/orchestrator/storage` instead.
 
 ## Tests
 

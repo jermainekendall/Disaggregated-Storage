@@ -191,6 +191,13 @@ func (a *Agent) register(ctx context.Context) error {
 			if err := identity.WriteJSON(StatePath(a.cfg), State{PeerID: id}); err != nil {
 				log.Printf("could not save state: %v", err)
 			}
+			if f := a.cfg.PeerIDFile; f != "" {
+				// Public on purpose: the ID is not a secret, and local users'
+				// uploads read it to avoid storing their own shards here.
+				if err := writePublic(f, id+"\n"); err != nil {
+					log.Printf("could not write %s: %v", f, err)
+				}
+			}
 			log.Printf("registered with server as peer %s", id)
 			return nil
 		}
@@ -478,6 +485,17 @@ func (a *Agent) scrub(ctx context.Context) {
 	if bad > 0 {
 		log.Printf("scrub: removed %d corrupt shards", bad)
 	}
+}
+
+func writePublic(path, content string) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o644); err != nil { // the service's umask is 077
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func hashFile(p string) (string, error) {

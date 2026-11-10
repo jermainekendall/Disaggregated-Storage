@@ -52,6 +52,8 @@ services:
       PEER_REGISTRY_ADDR: peer-registry:50051
       PLACEMENT_ADDR: placement-service:50052
       BILLING_ADDR: billing-service:50053
+      AUDIT_ADDR: audit-service:50054
+      KEY_METADATA_ADDR: key-metadata:50055
 
   peer-registry:
     <<: *service

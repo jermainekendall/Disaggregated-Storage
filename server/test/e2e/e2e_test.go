@@ -225,7 +225,8 @@ func TestEndToEnd(t *testing.T) {
 
 	gwPort := freePort(t)
 	e.start("api-gateway", "PORT="+gwPort, "JWT_SECRET=test-secret",
-		"PEER_REGISTRY_ADDR="+registry, "PLACEMENT_ADDR="+placement, "BILLING_ADDR="+billingAddr)
+		"PEER_REGISTRY_ADDR="+registry, "PLACEMENT_ADDR="+placement, "BILLING_ADDR="+billingAddr,
+		"AUDIT_ADDR="+auditAddr, "KEY_METADATA_ADDR="+keysAddr)
 	e.gateway = "http://127.0.0.1:" + gwPort
 	e.waitFor("gateway ready", 30*time.Second, func() bool {
 		resp, err := http.Get(e.gateway + "/ready")

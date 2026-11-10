@@ -71,6 +71,7 @@ type shardLocation struct {
 	Health      string   `json:"health_status"`
 	IsReplica   bool     `json:"is_replica"`
 	PeerID      string   `json:"peer_id"`
+	Libp2pID    string   `json:"libp2p_peer_id"`
 	PeerOnline  bool     `json:"peer_online"`
 	PeerAddress string   `json:"peer_address,omitempty"`
 	Multiaddrs  []string `json:"multiaddrs,omitempty"`
@@ -97,7 +98,8 @@ func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT s.shard_id, s.shard_index, s.shard_type, s.shard_size_bytes, COALESCE(s.shard_hash, ''),
-		       s.health_status, s.is_replica, s.peer_id, p.is_online, COALESCE(p.multiaddr, ''), p.multiaddrs
+		       s.health_status, s.is_replica, s.peer_id, COALESCE(p.libp2p_peer_id, ''), p.is_online,
+		       COALESCE(p.multiaddr, ''), p.multiaddrs
 		FROM shards s JOIN peers p ON p.peer_id = s.peer_id
 		WHERE s.file_id = $1 AND s.health_status IN ('good', 'pending', 'degraded')
 		ORDER BY s.shard_index, s.is_replica`, id)
@@ -110,7 +112,7 @@ func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var l shardLocation
 		if err := rows.Scan(&l.ShardID, &l.ShardIndex, &l.ShardType, &l.SizeBytes, &l.ShardHash, &l.Health,
-			&l.IsReplica, &l.PeerID, &l.PeerOnline, &l.PeerAddress, pq.Array(&l.Multiaddrs)); err != nil {
+			&l.IsReplica, &l.PeerID, &l.Libp2pID, &l.PeerOnline, &l.PeerAddress, pq.Array(&l.Multiaddrs)); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal", err.Error())
 			return
 		}
@@ -204,6 +206,7 @@ func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ShardIndex  int32    `json:"shard_index"`
 		ShardType   string   `json:"shard_type"`
 		PeerID      string   `json:"peer_id"`
+		Libp2pID    string   `json:"libp2p_peer_id"`
 		PeerAddress string   `json:"peer_address"`
 		Multiaddrs  []string `json:"multiaddrs,omitempty"`
 	}
@@ -232,7 +235,7 @@ func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
 				fileID, p.PeerId, p.ShardIndex, p.ShardType, sel.ShardSizeBytes).Scan(&shardID); err != nil {
 				return err
 			}
-			out = append(out, assignment{shardID, p.ShardIndex, p.ShardType, p.PeerId, p.PeerAddress, p.Multiaddrs})
+			out = append(out, assignment{shardID, p.ShardIndex, p.ShardType, p.PeerId, p.Libp2PPeerId, p.PeerAddress, p.Multiaddrs})
 		}
 		return nil
 	})

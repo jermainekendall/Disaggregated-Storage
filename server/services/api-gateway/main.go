@@ -11,6 +11,11 @@
 //	GET    /api/v1/files/{id}           file + shard locations for download
 //	DELETE /api/v1/files/{id}
 //	GET    /api/v1/peers
+//	GET    /api/v1/keys/master          wrapped master key (404 before the first upload)
+//	PUT    /api/v1/keys/master          {wrapped_master_key}
+//	GET    /api/v1/files/{id}/key       wrapped file key
+//	PUT    /api/v1/files/{id}/key       {wrapped_key, algorithm}
+//	POST   /api/v1/shards/{id}/challenges  audit challenges for a shard of your file
 //
 // Peer agents (TEST DEPLOYMENT: not authenticated, scoped by peer UUID):
 //
@@ -18,6 +23,8 @@
 //	POST   /api/v1/shards/{id}/confirm            {peer_id, shard_hash} after storing a shard
 //	GET    /api/v1/peers/{peer_id}/pending-shards shards to store/rebuild/copy and to delete
 //	POST   /api/v1/shards/{id}/deleted            {peer_id} after deleting a retiring shard
+//	GET    /api/v1/peers/{peer_id}/audits         audit challenges to answer
+//	POST   /api/v1/audits/{id}/response           {proof}
 //
 // Peer registration and placement go through the peer-registry and
 // placement gRPC services, so validation lives in one place.
@@ -39,7 +46,9 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/jermainekendall/disaggregated-storage/server/internal/common"
+	auditpb "github.com/jermainekendall/disaggregated-storage/server/proto/audit"
 	billingpb "github.com/jermainekendall/disaggregated-storage/server/proto/billing"
+	keypb "github.com/jermainekendall/disaggregated-storage/server/proto/keymeta"
 	peerpb "github.com/jermainekendall/disaggregated-storage/server/proto/peer"
 	placementpb "github.com/jermainekendall/disaggregated-storage/server/proto/placement"
 )
@@ -52,6 +61,8 @@ type config struct {
 	PeerRegistry   string
 	Placement      string
 	Billing        string
+	Audit          string
+	KeyMetadata    string
 	AllowedOrigins string
 }
 
@@ -70,6 +81,8 @@ func loadConfig() config {
 		PeerRegistry:   common.Env("PEER_REGISTRY_ADDR", "peer-registry:50051"),
 		Placement:      common.Env("PLACEMENT_ADDR", "placement-service:50052"),
 		Billing:        common.Env("BILLING_ADDR", "billing-service:50053"),
+		Audit:          common.Env("AUDIT_ADDR", "audit-service:50054"),
+		KeyMetadata:    common.Env("KEY_METADATA_ADDR", "key-metadata:50055"),
 		AllowedOrigins: common.Env("CORS_ALLOWED_ORIGINS", "*"),
 	}
 }
@@ -92,6 +105,8 @@ type server struct {
 	peers     peerpb.PeerRegistryClient
 	placement placementpb.PlacementServiceClient
 	billing   billingpb.BillingServiceClient
+	audits    auditpb.AuditServiceClient
+	keys      keypb.KeyMetadataServiceClient
 	limiter   *ipLimiter
 }
 
@@ -111,6 +126,8 @@ func (s *server) routes() http.Handler {
 	api.HandleFunc("/peers/{peer_id}/pending-shards", s.handlePendingShards).Methods("GET")
 	api.HandleFunc("/shards/{id}/confirm", s.handleConfirmShard).Methods("POST")
 	api.HandleFunc("/shards/{id}/deleted", s.handleShardDeleted).Methods("POST")
+	api.HandleFunc("/peers/{peer_id}/audits", s.handlePeerAudits).Methods("GET")
+	api.HandleFunc("/audits/{id}/response", s.handleAuditResponse).Methods("POST")
 
 	authed := api.NewRoute().Subrouter()
 	authed.Use(s.requireAuth)
@@ -121,6 +138,11 @@ func (s *server) routes() http.Handler {
 	authed.HandleFunc("/files/{id}", s.handleGetFile).Methods("GET")
 	authed.HandleFunc("/files/{id}", s.handleDeleteFile).Methods("DELETE")
 	authed.HandleFunc("/peers", s.handleListPeers).Methods("GET")
+	authed.HandleFunc("/keys/master", s.handleGetMasterKey).Methods("GET")
+	authed.HandleFunc("/keys/master", s.handlePutMasterKey).Methods("PUT")
+	authed.HandleFunc("/files/{id}/key", s.handleGetFileKey).Methods("GET")
+	authed.HandleFunc("/files/{id}/key", s.handlePutFileKey).Methods("PUT")
+	authed.HandleFunc("/shards/{id}/challenges", s.handleRegisterChallenges).Methods("POST")
 
 	r.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint")
@@ -179,6 +201,8 @@ func main() {
 		peers:     peerpb.NewPeerRegistryClient(dial(cfg.PeerRegistry)),
 		placement: placementpb.NewPlacementServiceClient(dial(cfg.Placement)),
 		billing:   billingpb.NewBillingServiceClient(dial(cfg.Billing)),
+		audits:    auditpb.NewAuditServiceClient(dial(cfg.Audit)),
+		keys:      keypb.NewKeyMetadataServiceClient(dial(cfg.KeyMetadata)),
 		limiter:   newIPLimiter(cfg.RatePerMinute),
 	}
 	go s.limiter.cleanup(ctx)

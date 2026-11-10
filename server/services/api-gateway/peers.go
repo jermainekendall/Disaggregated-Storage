@@ -117,21 +117,26 @@ func (s *server) handleConfirmShard(w http.ResponseWriter, r *http.Request) {
 }
 
 type shardSource struct {
+	ShardID    string   `json:"shard_id"`
 	ShardIndex int      `json:"shard_index"`
 	PeerID     string   `json:"peer_id"`
+	Libp2pID   string   `json:"libp2p_peer_id"`
 	Multiaddrs []string `json:"multiaddrs"`
 }
 
 type pendingShard struct {
-	ShardID      string        `json:"shard_id"`
-	FileID       string        `json:"file_id"`
-	ShardIndex   int           `json:"shard_index"`
-	ShardType    string        `json:"shard_type"`
-	SizeBytes    int64         `json:"shard_size_bytes"`
-	IsReplica    bool          `json:"is_replica"`
-	DataShards   int           `json:"data_shards"`
-	ParityShards int           `json:"parity_shards"`
-	FileStatus   string        `json:"file_status"`
+	ShardID      string `json:"shard_id"`
+	FileID       string `json:"file_id"`
+	ShardIndex   int    `json:"shard_index"`
+	ShardType    string `json:"shard_type"`
+	SizeBytes    int64  `json:"shard_size_bytes"`
+	IsReplica    bool   `json:"is_replica"`
+	DataShards   int    `json:"data_shards"`
+	ParityShards int    `json:"parity_shards"`
+	FileStatus   string `json:"file_status"`
+	// SHA-256 of this shard index as first confirmed, so a rebuilt or copied
+	// shard can be checked before it is confirmed. Empty for new uploads.
+	ExpectedHash string        `json:"expected_hash,omitempty"`
 	Sources      []shardSource `json:"sources"` // good copies on online peers
 }
 
@@ -146,7 +151,10 @@ func (s *server) handlePendingShards(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT s.shard_id, s.file_id, s.shard_index, s.shard_type, s.shard_size_bytes, s.is_replica,
-		       f.shard_count, f.parity_shards, f.status
+		       f.shard_count, f.parity_shards, f.status,
+		       COALESCE((SELECT o.shard_hash FROM shards o WHERE o.file_id = s.file_id
+		                 AND o.shard_index = s.shard_index AND o.shard_hash IS NOT NULL
+		                 ORDER BY o.stored_at LIMIT 1), '')
 		FROM shards s JOIN files f ON f.file_id = s.file_id
 		WHERE s.peer_id = $1 AND s.health_status = 'pending'
 		ORDER BY s.stored_at LIMIT 100`, peerID)
@@ -158,7 +166,7 @@ func (s *server) handlePendingShards(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var p pendingShard
 		if err := rows.Scan(&p.ShardID, &p.FileID, &p.ShardIndex, &p.ShardType, &p.SizeBytes, &p.IsReplica,
-			&p.DataShards, &p.ParityShards, &p.FileStatus); err != nil {
+			&p.DataShards, &p.ParityShards, &p.FileStatus, &p.ExpectedHash); err != nil {
 			rows.Close()
 			writeError(w, http.StatusInternalServerError, "internal", err.Error())
 			return
@@ -174,7 +182,8 @@ func (s *server) handlePendingShards(w http.ResponseWriter, r *http.Request) {
 			continue // the uploader sends this shard directly
 		}
 		src, err := s.db.QueryContext(r.Context(), `
-			SELECT s.shard_index, s.peer_id, COALESCE(p.multiaddrs, ARRAY[p.multiaddr])
+			SELECT s.shard_id, s.shard_index, s.peer_id, COALESCE(p.libp2p_peer_id, ''),
+			       COALESCE(p.multiaddrs, ARRAY[p.multiaddr])
 			FROM shards s JOIN peers p ON p.peer_id = s.peer_id
 			WHERE s.file_id = $1 AND s.health_status = 'good' AND p.is_online AND s.peer_id != $2
 			ORDER BY (s.shard_index = $3) DESC, random()
@@ -184,7 +193,7 @@ func (s *server) handlePendingShards(w http.ResponseWriter, r *http.Request) {
 		}
 		for src.Next() {
 			var ss shardSource
-			if src.Scan(&ss.ShardIndex, &ss.PeerID, pq.Array(&ss.Multiaddrs)) == nil {
+			if src.Scan(&ss.ShardID, &ss.ShardIndex, &ss.PeerID, &ss.Libp2pID, pq.Array(&ss.Multiaddrs)) == nil {
 				p.Sources = append(p.Sources, ss)
 			}
 		}

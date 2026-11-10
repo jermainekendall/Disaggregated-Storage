@@ -1,0 +1,18 @@
+# systemd user unit for the Orchestrator storage agent.
+# Install:  make install install-service
+# Logs:     journalctl --user -u orchestrator-agent -f
+[Unit]
+Description=Orchestrator storage agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/orchestrator run
+Restart=on-failure
+RestartSec=10
+# Shards and keys are private to this user.
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

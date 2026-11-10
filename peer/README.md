@@ -12,43 +12,45 @@ The server side is in [`../server`](../server/README.md) and must be running.
 
 ## Install
 
-You need Go 1.24 or newer to build. From this folder:
+From this folder, as your normal user (not root):
 
 ```bash
-make install
+./install.sh
 ```
 
-That puts the binary in `~/.local/bin/orchestrator`. Then configure it:
+The installer:
+- installs the build tools with apt;
+- installs Go 1.24 from go.dev if needed (Ubuntu 24.04's packaged Go is too old),
+  checking the published SHA-256;
+- builds `orchestrator` into `~/.local/bin`;
+- runs `orchestrator setup`;
+- opens the agent's port in ufw if the firewall is active;
+- installs and starts the systemd user service;
+- checks that the server's gateway and registry are reachable.
 
-```bash
-orchestrator setup
-```
+Re-run it after pulling new code: it rebuilds and restarts the agent.
 
 Setup asks for the gateway URL (e.g. `http://192.168.1.201:30080`), the
 registry address (`192.168.1.201:30051`), the relay address (printed at the end
-of the server install), the storage directory and how much space to offer.
-
-Run the agent in the foreground once to check it registers:
-
-```bash
-orchestrator run
-```
-
-Then run it as a systemd user service, so it starts with your session:
+of the server install), the storage directory and how much space to offer. To
+skip the questions, pass the answers after `--`:
 
 ```bash
-make install-service
+./install.sh -y -- --non-interactive --gateway http://192.168.1.201:30080 --registry 192.168.1.201:30051 --relay /ip4/192.168.1.201/tcp/30001/p2p/<relay-id> --storage-gb 50
 ```
+
+Other options: `--linger` keeps the agent running while you are logged out,
+`--no-service` skips the systemd service, and `--no-setup` skips configuration.
+`./install.sh --help` lists them all.
+
+Agent logs:
 
 ```bash
 journalctl --user -u orchestrator-agent -f
 ```
 
-To keep it running while you are logged out:
-
-```bash
-sudo loginctl enable-linger $USER
-```
+Without the installer (Go 1.24+ already installed), `make install` builds the
+binary and `make install-service` installs the service.
 
 ## Use
 

@@ -4,6 +4,7 @@
 #   docker compose up --build
 #
 # Gateway: http://localhost:8080   Peer registry (gRPC): localhost:50051
+# Admin console: http://localhost:8088 (admin@localhost.test / local-dev-admin-password)
 # Relay: /ip4/127.0.0.1/tcp/4001 (random identity; fine for local runs)
 # CockroachDB console: http://localhost:8081
 x-service: &service
@@ -132,6 +133,19 @@ services:
     environment:
       <<: *env
       SERVICE_NAME: analytics-worker
+
+  admin-console:
+    <<: *service
+    image: orchestrator/admin-console:dev
+    build: {context: ., args: {SERVICE: admin-console}}
+    ports: ["8088:8080"]
+    environment:
+      <<: *env
+      SERVICE_NAME: admin-console
+      BILLING_ADDR: billing-service:50053
+      SESSION_SECRET: local-dev-session-secret-change-me
+      ADMIN_BOOTSTRAP_EMAIL: admin@localhost.test
+      ADMIN_BOOTSTRAP_PASSWORD: local-dev-admin-password
 
   relay-service:
     image: orchestrator/relay-service:dev

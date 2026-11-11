@@ -13,6 +13,7 @@
 --   cockroach sql --insecure --host=<host> --database=orchestrator < schema.sql
 --
 -- CHANGELOG
+-- v3.1 (2026-11-11): users.role and admin_audit_log for the admin console
 -- v3.0 (2026-11-08):
 --   - peers: user_id nullable (peers can register before an account is linked);
 --     libp2p_peer_id (unique), multiaddr, multiaddrs folded in from migration 001;
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS users (
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL, -- bcrypt
     tier VARCHAR(20) NOT NULL DEFAULT 'free', -- 'free', 'paid'
+    role VARCHAR(20) NOT NULL DEFAULT 'user', -- 'user', 'admin' (admin console access)
     status VARCHAR(20) NOT NULL DEFAULT 'active', -- 'active', 'suspended', 'deleted'
 
     storage_contributed_gb INT NOT NULL DEFAULT 0,
@@ -511,6 +513,22 @@ CREATE TABLE IF NOT EXISTS analytics_events (
     INDEX idx_created_at (created_at)
 );
 
+-- Every change made through the admin console.
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+    entry_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    admin_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    admin_email VARCHAR(255) NOT NULL,
+    action VARCHAR(50) NOT NULL,       -- e.g. 'user.suspend', 'config.update'
+    target_type VARCHAR(30),           -- 'user', 'peer', 'file', 'config', ...
+    target_id VARCHAR(100),
+    details JSONB,
+    client_ip VARCHAR(45),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+
+    INDEX idx_created_at (created_at),
+    INDEX idx_target (target_type, target_id)
+);
+
 -- ============================================================================
 -- SYSTEM CONFIGURATION
 -- ============================================================================
@@ -550,6 +568,8 @@ ON CONFLICT (config_key) DO NOTHING;
 -- ============================================================================
 -- UPGRADES from v2.0 / migration 001 (no-ops on a fresh database)
 -- ============================================================================
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'user';
 
 ALTER TABLE peers ALTER COLUMN user_id DROP NOT NULL;
 ALTER TABLE peers ADD COLUMN IF NOT EXISTS libp2p_peer_id VARCHAR(100);

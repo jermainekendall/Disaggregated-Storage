@@ -1,0 +1,39 @@
+{{define "content"}}
+{{$csrf := .CSRF}}
+{{with .F}}
+<p class="crumbs"><a href="/files">Files</a> /</p>
+<h1>File <span class="mono">{{short .ID}}</span> <span class="badge {{badge .Status}}">{{.Status}}</span></h1>
+<dl class="facts">
+  <dt>File ID</dt><dd class="mono">{{.ID}}</dd>
+  <dt>Owner</dt><dd><a href="/users/{{.OwnerID}}">{{.Owner}}</a></dd>
+  <dt>Size</dt><dd>{{bytes .Size}} stored{{if .Original.Valid}} · {{bytes .Original.Int64}} before compression and encryption{{end}}</dd>
+  <dt>Code</dt><dd>{{.Data}} data + {{.Parity}} parity shards · {{.Available}} of {{add .Data .Parity}} available · any {{.Data}} rebuild the file</dd>
+  <dt>Tier</dt><dd>{{.Tier}} · read {{.Access}} times · last {{nago .LastAccess}}</dd>
+  <dt>Uploaded</dt><dd>{{time .Created}}</dd>
+</dl>
+<div class="actions">
+  <form method="post" action="/files/{{.ID}}/repair">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <button {{if ge .Available (add .Data .Parity)}}disabled title="All shards are healthy"{{end}}>Repair now</button>
+    <span class="small muted">Queues a top-priority repair for missing shards.</span>
+  </form>
+</div>
+{{end}}
+
+<h2>Shard map</h2>
+{{if .Shards}}
+<table><thead><tr><th class="num">Index</th><th>Type</th><th>Peer</th><th class="num">Size</th><th>Health</th><th class="num">Failed audits</th><th>Stored</th></tr></thead>
+<tbody>{{range .Shards}}<tr>
+  <td class="num">{{.Index}}</td><td>{{.Type}}{{if .Replica}} (copy){{end}}</td>
+  <td><a href="/peers/{{.PeerID}}" class="mono">{{short .PeerID}}</a> {{if .PeerOnline}}<span class="badge ok">online</span>{{else}}<span class="badge bad">offline</span>{{end}}</td>
+  <td class="num">{{bytes .Size}}</td><td><span class="badge {{badge .Health}}">{{.Health}}</span></td>
+  <td class="num">{{.Failures}}</td><td>{{time .Stored}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="muted">No shards recorded.</p>{{end}}
+
+<h2>Repair jobs</h2>
+{{template "repairtable" .Repairs}}
+
+<h2>Admin history for this file</h2>
+{{template "logtable" .History}}
+{{end}}

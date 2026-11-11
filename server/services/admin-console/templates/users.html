@@ -1,0 +1,30 @@
+{{define "content"}}
+<h1>Users</h1>
+<form method="get" class="filters">
+  <input type="search" name="q" value="{{.Q}}" placeholder="search by email">
+  <select name="status">
+    <option value="" {{if eq .Status ""}}selected{{end}}>all</option>
+    <option value="active" {{if eq .Status "active"}}selected{{end}}>active</option>
+    <option value="suspended" {{if eq .Status "suspended"}}selected{{end}}>suspended</option>
+    <option value="admin" {{if eq .Status "admin"}}selected{{end}}>admins</option>
+  </select>
+  <button>Filter</button>
+</form>
+<table>
+<thead><tr><th>Email</th><th>Status</th><th>Role</th><th>Tier</th><th class="num">Used / quota</th><th class="num">Files</th><th class="num">Peers</th><th>Joined</th><th>Last login</th></tr></thead>
+<tbody>
+{{range .Users}}<tr>
+  <td><a href="/users/{{.ID}}">{{.Email}}</a></td>
+  <td><span class="badge {{badge .Status}}">{{.Status}}</span></td>
+  <td>{{if eq .Role "admin"}}<span class="badge ok">admin</span>{{else}}user{{end}}</td>
+  <td>{{.Tier}}</td>
+  <td class="num">{{bytes .UsedBytes}} / {{.QuotaGB}} GB</td>
+  <td class="num">{{.Files}}</td><td class="num">{{.Peers}}</td>
+  <td>{{time .Created}}</td><td>{{nago .LastLogin}}</td>
+</tr>{{else}}<tr><td colspan="9" class="muted">No users match.</td></tr>{{end}}
+</tbody></table>
+<div class="pager">
+  {{if gt .Page 1}}<a href="?q={{.Q}}&status={{.Status}}&page={{sub .Page 1}}">← Previous</a>{{end}}
+  {{if .More}}<a href="?q={{.Q}}&status={{.Status}}&page={{add .Page 1}}">Next →</a>{{end}}
+</div>
+{{end}}

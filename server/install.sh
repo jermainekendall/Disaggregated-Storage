@@ -6,7 +6,7 @@
 # Installs Docker, containerd and Kubernetes (kubeadm, single node, Flannel),
 # CockroachDB (insecure, 1 node), Redis, NATS and monitoring; applies the
 # database schema; builds the 10 service images and imports them into
-# containerd; creates the JWT and relay-identity secrets; deploys everything;
+# containerd; creates the JWT, relay-identity and admin console secrets; deploys everything;
 # and checks that it came up.
 #
 # Run from the server/ directory:   sudo ./install.sh        (asks to confirm)
@@ -41,7 +41,7 @@ USER_HOME="$(getent passwd "$CURRENT_USER" | cut -d: -f6)"
 LOG_FILE="/var/log/orchestrator-install.log"
 NS=orchestrator
 IMAGE_TAG=dev
-SERVICES=(api-gateway peer-registry placement-service billing-service audit-service key-metadata
+SERVICES=(api-gateway admin-console peer-registry placement-service billing-service audit-service key-metadata
           repair-worker replication-worker analytics-worker relay-service)
 
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -263,6 +263,22 @@ if ! k get secret gateway-secrets -n "$NS" >/dev/null 2>&1; then
     k create secret generic gateway-secrets -n "$NS" --from-literal=JWT_SECRET="$(openssl rand -hex 32)" >/dev/null
     log_success "Created gateway-secrets (random JWT_SECRET)"
 fi
+ADMIN_CREDS=/root/orchestrator-admin-credentials.txt
+if ! k get secret admin-console-secrets -n "$NS" >/dev/null 2>&1; then
+    # The first admin account. The password is never printed to the install
+    # log; it is saved to a root-only file instead. Set ADMIN_EMAIL before
+    # running the installer to choose the address.
+    ADMIN_EMAIL="${ADMIN_EMAIL:-admin@orchestrator.local}"
+    ADMIN_PASSWORD="$(openssl rand -base64 18 | tr -d '/+=')"
+    k create secret generic admin-console-secrets -n "$NS" \
+        --from-literal=SESSION_SECRET="$(openssl rand -hex 32)" \
+        --from-literal=ADMIN_BOOTSTRAP_EMAIL="$ADMIN_EMAIL" \
+        --from-literal=ADMIN_BOOTSTRAP_PASSWORD="$ADMIN_PASSWORD" >/dev/null
+    ( umask 077; printf 'Orchestrator admin console\nURL:      http://%s:30088\nEmail:    %s\nPassword: %s\n' \
+        "$NODE_IP" "$ADMIN_EMAIL" "$ADMIN_PASSWORD" > "$ADMIN_CREDS" )
+    unset ADMIN_PASSWORD
+    log_success "Created admin-console-secrets (admin sign-in saved to $ADMIN_CREDS)"
+fi
 if ! k get secret relay-identity -n "$NS" >/dev/null 2>&1; then
     # A stable relay peer ID: peers store relay addresses that include it.
     KEY=$(docker run --rm "orchestrator/relay-service:$IMAGE_TAG" -genkey)
@@ -293,6 +309,7 @@ else
     exit 1
 fi
 if nc -z "$NODE_IP" 30051; then log_success "Peer registry (gRPC) on $NODE_IP:30051"; fi
+if curl -fsS "http://$NODE_IP:30088/healthz" >/dev/null; then log_success "Admin console at http://$NODE_IP:30088"; fi
 if nc -z "$NODE_IP" 30001; then log_success "libp2p relay on $NODE_IP:30001"; fi
 RELAY_ID=$(k logs deployment/libp2p-relay -n "$NS" | grep -o 'relay 12D3[A-Za-z0-9]*' | head -1 | cut -d' ' -f2 || true)
 
@@ -304,6 +321,7 @@ cat <<EOF
 Endpoints (test deployment, no TLS):
   API gateway (HTTP)     http://$NODE_IP:30080        e.g. curl http://$NODE_IP:30080/health
   Peer registry (gRPC)   $NODE_IP:30051
+  Admin console          http://$NODE_IP:30088   sign-in: sudo cat $ADMIN_CREDS
   libp2p relay           /ip4/$NODE_IP/tcp/30001/p2p/${RELAY_ID:-<see relay logs>}
 
 Useful commands:

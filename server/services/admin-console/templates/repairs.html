@@ -1,0 +1,31 @@
+{{define "content"}}
+{{$csrf := .CSRF}}
+<h1>Repairs</h1>
+<p class="muted">When a shard is lost (its peer is gone, or it keeps failing audits), the repair worker picks a new peer, which rebuilds the shard from the surviving ones. Priority 0 is the most urgent.</p>
+<nav class="tabs">
+  <a href="?status=open" {{if eq .Status "open"}}class="on"{{end}}>Open</a>
+  <a href="?status=failed" {{if eq .Status "failed"}}class="on"{{end}}>Failed</a>
+  <a href="?status=completed" {{if eq .Status "completed"}}class="on"{{end}}>Completed</a>
+  <a href="?status=all" {{if eq .Status "all"}}class="on"{{end}}>All</a>
+</nav>
+{{if .Jobs}}
+<table>
+<thead><tr><th>Queued</th><th>File</th><th>Status</th><th class="num">Priority</th><th class="num">Missing</th><th class="num">Attempts</th><th>Reason</th><th>Last error</th><th>Updated</th><th></th></tr></thead>
+<tbody>
+{{range .Jobs}}<tr>
+  <td>{{time .Queued}}</td><td><a href="/files/{{.FileID}}" class="mono">{{short .FileID}}</a></td>
+  <td><span class="badge {{badge .Status}}">{{.Status}}</span></td><td class="num">{{.Priority}}</td>
+  <td class="num">{{.Missing}}</td><td class="num">{{.Attempts}}</td><td>{{.Reason}}</td>
+  <td class="small">{{.LastError}}</td><td>{{ago .Updated}}</td>
+  <td>{{if eq .Status "failed"}}<form method="post" action="/repairs/{{.ID}}/retry" class="inline">
+    <input type="hidden" name="csrf" value="{{$csrf}}"><button>Retry</button></form>{{end}}</td>
+</tr>{{end}}
+</tbody></table>
+{{else}}<p class="muted">No jobs here.</p>{{end}}
+
+<h2>Replication jobs (extra copies for popular files)</h2>
+{{if .Replication}}
+<table class="narrow"><thead><tr><th>Status</th><th class="num">Jobs</th></tr></thead>
+<tbody>{{range .Replication}}<tr><td><span class="badge {{badge .Status}}">{{.Status}}</span></td><td class="num">{{.N}}</td></tr>{{end}}</tbody></table>
+{{else}}<p class="muted">None yet.</p>{{end}}
+{{end}}

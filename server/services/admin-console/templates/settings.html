@@ -1,0 +1,28 @@
+{{define "content"}}
+{{$csrf := .CSRF}}
+<h1>Settings</h1>
+
+<h2>Used by the services</h2>
+<p class="muted">The billing service reads these each time it runs, so changes apply to the next calculation.</p>
+{{template "settingtable" (dict "Rows" .Live "CSRF" $csrf)}}
+
+<h2>Reference values</h2>
+<p class="muted">Kept for reference. The services take these from their deployment settings (server/deployments/*.yaml and the orchestrator-config ConfigMap); change them there and restart the service.</p>
+{{template "settingtable" (dict "Rows" .Reference "CSRF" $csrf)}}
+{{end}}
+
+{{define "settingtable"}}
+{{$csrf := .CSRF}}
+<table>
+<thead><tr><th>Setting</th><th>Description</th><th>Value</th><th>Last change</th></tr></thead>
+<tbody>
+{{range .Rows}}<tr>
+  <td class="mono">{{.Key}}</td><td>{{.Description}}</td>
+  <td><form method="post" action="/settings/{{.Key}}" class="inline">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <input name="value" value="{{.Value}}" size="10" aria-label="{{.Key}}"> <span class="small muted">{{.Type}}</span>
+    <button>Save</button></form></td>
+  <td class="small">{{if .UpdatedBy}}{{.UpdatedBy}}, {{ago .Updated}} (v{{.Version}}){{else}}default{{end}}</td>
+</tr>{{end}}
+</tbody></table>
+{{end}}

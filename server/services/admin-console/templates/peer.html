@@ -1,0 +1,52 @@
+{{define "content"}}
+{{$csrf := .CSRF}}
+{{with .P}}
+<p class="crumbs"><a href="/peers">Peers</a> /</p>
+<h1>Peer <span class="mono">{{short .ID}}</span>
+  {{if .Online}}<span class="badge ok">online</span>{{else}}<span class="badge bad">offline</span>{{end}}
+  {{if lt .Health 70.0}}<span class="badge warn">drained</span>{{end}}</h1>
+<dl class="facts">
+  <dt>Peer ID</dt><dd class="mono">{{.ID}}</dd>
+  <dt>libp2p ID</dt><dd class="mono">{{.Libp2p}}</dd>
+  <dt>Owner</dt><dd>{{if .Email}}<a href="/users/{{.UserID}}">{{.Email}}</a>{{else}}not linked to an account{{end}}</dd>
+  <dt>Device</dt><dd>{{.Device}} · agent {{.Version}} · {{.Network}} · {{if .Charging}}on power{{else}}on battery{{end}}{{if .Battery.Valid}} ({{.Battery.Int64}}%){{end}}</dd>
+  <dt>Location</dt><dd>{{if .Region}}{{.Region}}{{else}}no region{{end}} · {{if .ASN}}{{.ASN}}{{else}}no ASN{{end}} · {{.Timezone}}</dd>
+  <dt>Capacity</dt><dd>{{f1 .FreeGB}} GB free of {{.TotalGB}} GB · holds {{.Shards}} shards ({{bytes .ShardBytes}})</dd>
+  <dt>Health</dt><dd>health {{f1 .Health}} · reliability {{f1 .Reliability}} · {{if .Churn.Valid}}churn risk {{f1 .Churn.Float64}}{{else}}no churn estimate{{end}}</dd>
+  <dt>Audits</dt><dd>{{.AuditsOK}} passed · {{.AuditsFailed}} failed</dd>
+  <dt>Served</dt><dd>{{bytes .BytesServed}}</dd>
+  <dt>Seen</dt><dd>first {{time .FirstSeen}} · last heartbeat {{ago .LastHeartbeat}}</dd>
+</dl>
+
+<h2>Manage</h2>
+<div class="actions">
+  <form method="post" action="/peers/{{.ID}}/drain" data-confirm="Drain this peer? It gets no new shards and every shard it holds is rebuilt on other peers.">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <button class="danger">Drain peer</button>
+    <span class="small muted">Use before retiring a device, or when it misbehaves.</span>
+  </form>
+  <form method="post" action="/peers/{{.ID}}/health">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label>Health score <input type="number" name="health" min="0" max="200" step="1" value="{{printf "%.0f" .Health}}"></label>
+    <button>Save</button>
+    <span class="small muted">Below 70 the peer receives no new shards; 100 returns a drained peer to service.</span>
+  </form>
+</div>
+{{end}}
+
+<h2>Shards held</h2>
+{{if .Shards}}
+<table><thead><tr><th>File</th><th class="num">Index</th><th>Type</th><th class="num">Size</th><th>Health</th><th>Stored</th></tr></thead>
+<tbody>{{range .Shards}}<tr>
+  <td><a href="/files/{{.FileID}}" class="mono">{{short .FileID}}</a></td><td class="num">{{.Index}}</td>
+  <td>{{.Type}}{{if .Replica}} (copy){{end}}</td><td class="num">{{bytes .Size}}</td>
+  <td><span class="badge {{badge .Health}}">{{.Health}}</span></td><td>{{time .Stored}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="muted">No shards.</p>{{end}}
+
+<h2>Recent audits</h2>
+{{template "audittable" .Audits}}
+
+<h2>Admin history for this peer</h2>
+{{template "logtable" .History}}
+{{end}}

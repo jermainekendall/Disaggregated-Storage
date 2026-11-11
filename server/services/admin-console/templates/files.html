@@ -1,0 +1,21 @@
+{{define "content"}}
+<h1>Files</h1>
+<p class="muted">File names are encrypted by their owners and cannot be shown here.</p>
+<form method="get" class="filters">
+  <input type="search" name="q" value="{{.Q}}" placeholder="file id prefix or owner email">
+  <select name="status">
+    <option value="" {{if eq .Status ""}}selected{{end}}>all (except deleted)</option>
+    <option value="active" {{if eq .Status "active"}}selected{{end}}>active</option>
+    <option value="degraded" {{if eq .Status "degraded"}}selected{{end}}>degraded</option>
+    <option value="uploading" {{if eq .Status "uploading"}}selected{{end}}>uploading</option>
+    <option value="deleting" {{if eq .Status "deleting"}}selected{{end}}>deleting</option>
+    <option value="deleted" {{if eq .Status "deleted"}}selected{{end}}>deleted</option>
+  </select>
+  <button>Filter</button>
+</form>
+{{template "filetable" .Files}}
+<div class="pager">
+  {{if gt .Page 1}}<a href="?q={{.Q}}&status={{.Status}}&page={{sub .Page 1}}">← Previous</a>{{end}}
+  {{if .More}}<a href="?q={{.Q}}&status={{.Status}}&page={{add .Page 1}}">Next →</a>{{end}}
+</div>
+{{end}}

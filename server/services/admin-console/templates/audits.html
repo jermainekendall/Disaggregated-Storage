@@ -1,0 +1,20 @@
+{{define "content"}}
+<h1>Audits</h1>
+<p class="muted">Proof-of-storage challenges over the last 7 days. A peer that fails repeatedly has its shard marked missing and rebuilt elsewhere.</p>
+<section class="cards">
+  <div class="card"><h3>Passed</h3><div class="big">{{.Passed}}</div></div>
+  <div class="card"><h3>Failed</h3><div class="big {{if .Failed}}t-bad{{end}}">{{.Failed}}</div><p>wrong proof</p></div>
+  <div class="card"><h3>Timed out</h3><div class="big {{if .Timeout}}t-bad{{end}}">{{.Timeout}}</div><p>no answer in time</p></div>
+  <div class="card"><h3>Waiting</h3><div class="big">{{.Pending}}</div><p>sent, not answered yet</p></div>
+</section>
+<h2>Peers with failures</h2>
+{{if .Worst}}
+<table><thead><tr><th>Peer</th><th>libp2p ID</th><th class="num">Passed</th><th class="num">Failed or timed out</th><th class="num">Pass rate</th></tr></thead>
+<tbody>{{range .Worst}}<tr>
+  <td><a href="/peers/{{.PeerID}}" class="mono">{{short .PeerID}}</a></td><td class="mono small">{{.Libp2p}}</td>
+  <td class="num">{{.Passed}}</td><td class="num t-bad">{{.Failed}}</td><td class="num">{{pct .Passed (add .Passed .Failed)}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="muted">No peer failed an audit in the last 7 days.</p>{{end}}
+<h2>Recent failures</h2>
+{{template "audittable" .Recent}}
+{{end}}

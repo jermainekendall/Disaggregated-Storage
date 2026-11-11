@@ -31,6 +31,7 @@ server/
 | Service | Port | Exposed on the node | Purpose |
 |---|---|---|---|
 | api-gateway | HTTP 8080 | NodePort 30080 | Client and peer-agent API |
+| admin-console | HTTP 8080 | NodePort 30088 | Web interface for administrators |
 | peer-registry | gRPC 50051 | NodePort 30051 | Registration, heartbeats, lookup |
 | placement-service | gRPC 50052 | | Erasure code and peer choice per file |
 | billing-service | gRPC 50053 | | Monthly earnings, payouts |
@@ -51,6 +52,9 @@ Kubernetes probes) and reflection, so `grpcurl -plaintext <host>:<port> list` wo
 ```bash
 docker compose up --build
 ```
+
+The admin console is then at `http://localhost:8088` (sign in as
+`admin@localhost.test` with `local-dev-admin-password`).
 
 **On a single Ubuntu 24.04 machine with Kubernetes:**
 
@@ -78,6 +82,46 @@ TEST_DATABASE_URL='postgresql://root@localhost:26257/defaultdb?sslmode=disable' 
 The end-to-end test builds every service, starts them against the database
 and runs peer registration, upload, audits, repair, replication, billing, keys,
 analytics and deletion.
+
+## Admin console
+
+Open `http://<node-ip>:30088` and sign in with an administrator account.
+`install.sh` creates the first one (set `ADMIN_EMAIL` before running it to choose
+the address) and saves the sign-in to a root-only file:
+
+```bash
+sudo cat /root/orchestrator-admin-credentials.txt
+```
+
+From the console you can:
+
+| Page | What it is for |
+|---|---|
+| Dashboard | users, peers online, capacity, stored data, missing shards, open repairs, audit pass rate, pending billing |
+| Users | search; suspend or reactivate; change tier and storage quota; grant or remove admin; set a new password |
+| Peers | health, capacity, shards held and audit record; **drain** a peer (no new shards, and its shards are rebuilt elsewhere); set its health score |
+| Files | owner, code, shard map and health; queue a repair at top priority (names are encrypted and never shown) |
+| Repairs | open, failed and completed repair jobs; retry a failed one; replication job counts |
+| Audits | pass, fail and timeout counts; peers with failures; recent failures |
+| Billing | earnings per month; run billing for a month; approve pending earnings; settle payouts |
+| Settings | earnings rates, payout minimum and audit penalty (used by billing on its next run); reference values |
+| Admin log | every change made in the console, with who, when and from where |
+
+Protections:
+- Admins cannot suspend themselves or remove their own admin role.
+- Every request re-checks that the account is still an active admin, so revoking
+  access takes effect at once.
+- Forms carry CSRF tokens, sign-in attempts are rate-limited, and session cookies
+  are `HttpOnly` and `SameSite=Strict`.
+- Passwords are never written to the admin log.
+
+It is served over plain HTTP in this test deployment, so keep it on a trusted
+network. Before exposing it further, put it behind TLS (for example an ingress
+with a certificate) and set `COOKIE_SECURE=true` in
+`deployments/11-admin-console.yaml`.
+
+More admins: create the account through the normal sign-up, then grant it the
+admin role on its Users page.
 
 ## How data flows
 

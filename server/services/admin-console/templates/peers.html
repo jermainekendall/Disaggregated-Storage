@@ -1,0 +1,18 @@
+{{define "content"}}
+<h1>Peers</h1>
+<form method="get" class="filters">
+  <input type="search" name="q" value="{{.Q}}" placeholder="peer id, libp2p id, owner email, region, device, ASN">
+  <select name="status">
+    <option value="" {{if eq .Status ""}}selected{{end}}>all</option>
+    <option value="online" {{if eq .Status "online"}}selected{{end}}>online</option>
+    <option value="offline" {{if eq .Status "offline"}}selected{{end}}>offline</option>
+    <option value="drained" {{if eq .Status "drained"}}selected{{end}}>drained (health below 70)</option>
+  </select>
+  <button>Filter</button>
+</form>
+{{template "peertable" .Peers}}
+<div class="pager">
+  {{if gt .Page 1}}<a href="?q={{.Q}}&status={{.Status}}&page={{sub .Page 1}}">← Previous</a>{{end}}
+  {{if .More}}<a href="?q={{.Q}}&status={{.Status}}&page={{add .Page 1}}">Next →</a>{{end}}
+</div>
+{{end}}

@@ -1,0 +1,144 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestrator Admin</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+{{if .Admin}}
+<header class="top">
+  <a class="brand" href="/">Orchestrator <span>admin</span></a>
+  <nav>
+    <a href="/" {{if eq .Path "/"}}class="on"{{end}}>Dashboard</a>
+    <a href="/users" {{if eq .Path "/users"}}class="on"{{end}}>Users</a>
+    <a href="/peers" {{if eq .Path "/peers"}}class="on"{{end}}>Peers</a>
+    <a href="/files" {{if eq .Path "/files"}}class="on"{{end}}>Files</a>
+    <a href="/repairs" {{if eq .Path "/repairs"}}class="on"{{end}}>Repairs</a>
+    <a href="/audits" {{if eq .Path "/audits"}}class="on"{{end}}>Audits</a>
+    <a href="/billing" {{if eq .Path "/billing"}}class="on"{{end}}>Billing</a>
+    <a href="/settings" {{if eq .Path "/settings"}}class="on"{{end}}>Settings</a>
+    <a href="/log" {{if eq .Path "/log"}}class="on"{{end}}>Admin log</a>
+  </nav>
+  <form method="post" action="/logout" class="who">
+    <span>{{.Admin.Email}}</span>
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button class="link">Sign out</button>
+  </form>
+</header>
+{{end}}
+<main>
+{{if .Msg}}<div class="flash ok">{{.Msg}}</div>{{end}}
+{{if .Err}}<div class="flash bad">{{.Err}}</div>{{end}}
+{{template "content" .}}
+</main>
+</body>
+</html>{{end}}
+
+{{define "logtable"}}
+{{if .}}
+<table>
+<thead><tr><th>When</th><th>Admin</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>
+<tbody>
+{{range .}}<tr>
+  <td title="{{time .When}}">{{ago .When}}</td><td>{{.Email}}</td><td><code>{{.Action}}</code></td>
+  <td>{{if eq .Type "user"}}<a href="/users/{{.Target}}">user {{short .Target}}</a>{{else if eq .Type "peer"}}<a href="/peers/{{.Target}}">peer {{short .Target}}</a>{{else if eq .Type "file"}}<a href="/files/{{.Target}}">file {{short .Target}}</a>{{else}}{{.Type}} {{.Target}}{{end}}</td>
+  <td class="mono small">{{.Details}}</td>
+</tr>{{end}}
+</tbody></table>
+{{else}}<p class="muted">Nothing yet.</p>{{end}}
+{{end}}
+
+{{define "peertable"}}
+{{if .}}
+<table>
+<thead><tr><th>Peer</th><th>Status</th><th>Owner</th><th>Device</th><th>Region / ASN</th><th class="num">Health</th><th class="num">Shards</th><th class="num">Free / total</th><th class="num">Audits</th><th>Last heartbeat</th></tr></thead>
+<tbody>
+{{range .}}<tr>
+  <td><a href="/peers/{{.ID}}" class="mono">{{short .ID}}</a></td>
+  <td>{{if .Online}}<span class="badge ok">online</span>{{else}}<span class="badge bad">offline</span>{{end}}{{if lt .Health 70.0}} <span class="badge warn">drained</span>{{end}}</td>
+  <td>{{if .Email}}<a href="/users/{{.UserID}}">{{.Email}}</a>{{else}}<span class="muted">unlinked</span>{{end}}</td>
+  <td>{{.Device}}</td>
+  <td>{{if .Region}}{{.Region}}{{else}}-{{end}} / {{if .ASN}}{{.ASN}}{{else}}-{{end}}</td>
+  <td class="num">{{f1 .Health}}</td>
+  <td class="num">{{.Shards}}<br><span class="small muted">{{bytes .ShardBytes}}</span></td>
+  <td class="num">{{f1 .FreeGB}} / {{.TotalGB}} GB</td>
+  <td class="num">{{.AuditsOK}} ✓ {{if .AuditsFailed}}<span class="t-bad">{{.AuditsFailed}} ✗</span>{{end}}</td>
+  <td>{{ago .LastHeartbeat}}</td>
+</tr>{{end}}
+</tbody></table>
+{{else}}<p class="muted">None.</p>{{end}}
+{{end}}
+
+{{define "filetable"}}
+{{if .}}
+<table>
+<thead><tr><th>File</th><th>Owner</th><th>Status</th><th class="num">Stored</th><th class="num">Shards</th><th>Tier</th><th class="num">Reads</th><th>Uploaded</th></tr></thead>
+<tbody>
+{{range .}}<tr>
+  <td><a href="/files/{{.ID}}" class="mono">{{short .ID}}</a></td>
+  <td>{{if .Owner}}<a href="/users/{{.OwnerID}}">{{.Owner}}</a>{{end}}</td>
+  <td><span class="badge {{badge .Status}}">{{.Status}}</span></td>
+  <td class="num">{{bytes .Size}}</td>
+  <td class="num {{if lt .Available (add .Data .Parity)}}t-warn{{end}}">{{.Available}} / {{add .Data .Parity}}<br><span class="small muted">{{.Data}}+{{.Parity}}</span></td>
+  <td><span class="badge {{badge .Tier}}">{{.Tier}}</span></td>
+  <td class="num">{{.Access}}</td>
+  <td>{{time .Created}}</td>
+</tr>{{end}}
+</tbody></table>
+{{else}}<p class="muted">None.</p>{{end}}
+{{end}}
+
+{{define "payouttable"}}
+{{$csrf := .CSRF}}
+{{if .Payouts}}
+<table>
+<thead><tr><th>Created</th><th>User</th><th class="num">Amount</th><th>Method</th><th>Status</th><th>Settle</th></tr></thead>
+<tbody>
+{{range .Payouts}}<tr>
+  <td>{{time .Created}}</td>
+  <td><a href="/users/{{.UserID}}">{{.Email}}</a></td>
+  <td class="num">{{money .Amount}}</td><td>{{.Method}}</td>
+  <td><span class="badge {{badge .Status}}">{{.Status}}</span>{{if .Reason}}<br><span class="small">{{.Reason}}</span>{{end}}</td>
+  <td>{{if or (eq .Status "pending") (eq .Status "processing")}}
+    <form method="post" action="/payouts/{{.ID}}/status" class="inline" data-confirm="Mark this payout completed?">
+      <input type="hidden" name="csrf" value="{{$csrf}}"><input type="hidden" name="status" value="completed">
+      <button>Completed</button></form>
+    <form method="post" action="/payouts/{{.ID}}/status" class="inline">
+      <input type="hidden" name="csrf" value="{{$csrf}}"><input type="hidden" name="status" value="failed">
+      <input name="reason" placeholder="reason" required size="12"><button class="danger">Failed</button></form>
+  {{else}}{{ntime .Completed}}{{end}}</td>
+</tr>{{end}}
+</tbody></table>
+{{else}}<p class="muted">No payouts.</p>{{end}}
+{{end}}
+
+{{define "audittable"}}
+{{if .}}
+<table>
+<thead><tr><th>Challenged</th><th>Shard</th><th>Peer</th><th>Status</th><th>Reason</th></tr></thead>
+<tbody>
+{{range .}}<tr>
+  <td>{{ntime .Challenged}}</td><td class="mono">{{short .ShardID}}</td>
+  <td><a href="/peers/{{.PeerID}}" class="mono">{{short .PeerID}}</a></td>
+  <td><span class="badge {{badge .Status}}">{{.Status}}</span></td><td>{{.Reason}}</td>
+</tr>{{end}}
+</tbody></table>
+{{else}}<p class="muted">None.</p>{{end}}
+{{end}}
+
+{{define "repairtable"}}
+{{if .}}
+<table>
+<thead><tr><th>Queued</th><th>File</th><th>Status</th><th class="num">Priority</th><th class="num">Missing</th><th class="num">Attempts</th><th>Reason</th><th>Last error</th></tr></thead>
+<tbody>
+{{range .}}<tr>
+  <td>{{time .Queued}}</td><td><a href="/files/{{.FileID}}" class="mono">{{short .FileID}}</a></td>
+  <td><span class="badge {{badge .Status}}">{{.Status}}</span></td><td class="num">{{.Priority}}</td>
+  <td class="num">{{.Missing}}</td><td class="num">{{.Attempts}}</td><td>{{.Reason}}</td><td class="small">{{.LastError}}</td>
+</tr>{{end}}
+</tbody></table>
+{{else}}<p class="muted">None.</p>{{end}}
+{{end}}

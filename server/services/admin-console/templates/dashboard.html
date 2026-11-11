@@ -1,0 +1,38 @@
+{{define "content"}}
+<h1>Dashboard</h1>
+{{with .S}}
+<section class="cards">
+  <a class="card" href="/users">
+    <h3>Users</h3><div class="big">{{.Users}}</div>
+    <p>{{.ActiveUsers}} active · {{.SuspendedUsers}} suspended · {{.Admins}} {{if eq .Admins 1}}admin{{else}}admins{{end}}</p>
+  </a>
+  <a class="card" href="/peers">
+    <h3>Peers online</h3><div class="big">{{.OnlinePeers}} <small>/ {{.Peers}}</small></div>
+    <p>{{gb .CapacityGB}} offered · {{gb .FreeGB}} free</p>
+  </a>
+  <a class="card" href="/files">
+    <h3>Stored</h3><div class="big">{{bytes .StoredBytes}}</div>
+    <p>{{.FilesActive}} active · <span class="{{if .FilesDegraded}}t-warn{{end}}">{{.FilesDegraded}} degraded</span> · {{.FilesUploading}} uploading</p>
+  </a>
+  <div class="card">
+    <h3>Shards</h3><div class="big">{{.ShardsGood}} <small>good</small></div>
+    <p><span class="{{if .ShardsMissing}}t-bad{{end}}">{{.ShardsMissing}} missing</span> · {{.ShardsPending}} pending</p>
+  </div>
+  <a class="card" href="/repairs">
+    <h3>Repairs</h3><div class="big">{{.RepairsOpen}} <small>open</small></div>
+    <p class="{{if .RepairsFailed}}t-bad{{end}}">{{.RepairsFailed}} failed</p>
+  </a>
+  <a class="card" href="/audits">
+    <h3>Audits, last 24 h</h3><div class="big">{{pct .AuditsPassed (add .AuditsPassed .AuditsFailed)}} <small>passed</small></div>
+    <p>{{.AuditsPassed}} passed · <span class="{{if .AuditsFailed}}t-bad{{end}}">{{.AuditsFailed}} failed</span></p>
+  </a>
+  <a class="card" href="/billing">
+    <h3>Billing</h3><div class="big">{{money .PendingEarnings}}</div>
+    <p>earnings awaiting approval · {{money .PendingPayouts}} in open payouts</p>
+  </a>
+</section>
+{{end}}
+<h2>Recent admin activity</h2>
+{{template "logtable" .Log}}
+<p><a href="/log">Full admin log →</a></p>
+{{end}}

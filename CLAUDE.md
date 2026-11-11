@@ -29,6 +29,9 @@ Full server-side design and known gaps: `docs/SERVER_SIDE_TECHNICAL_REFERENCE.md
   every service checks the columns it uses at startup.
 - `server/proto/` holds the only .proto files; regenerate stubs with `make proto`.
 - Tests: `go test ./...` (unit) and `server/test/e2e` (needs a CockroachDB, see README).
+- Admin web console: `server/services/admin-console` (server-rendered Go templates,
+  NodePort 30088). Admins are users with `role = 'admin'`; every change goes to
+  `admin_audit_log`.
 - The Kubernetes manifests in `server/deployments/` are the single, test-sized set
   (1 replica each, canonical ports 50051-50055). They are deployed on the user's
   single-node test cluster (192.168.1.201).

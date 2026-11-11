@@ -1,0 +1,73 @@
+{{define "content"}}
+{{$csrf := .CSRF}}
+{{with .U}}
+<p class="crumbs"><a href="/users">Users</a> /</p>
+<h1>{{.Email}} <span class="badge {{badge .Status}}">{{.Status}}</span> {{if eq .Role "admin"}}<span class="badge ok">admin</span>{{end}}</h1>
+<p class="muted mono">{{.ID}} · joined {{time .Created}} · last login {{nago .LastLogin}}</p>
+
+<section class="cards">
+  <div class="card"><h3>Storage used</h3><div class="big">{{bytes .UsedBytes}}</div><p>of {{.QuotaGB}} GB quota · {{.Files}} files</p></div>
+  <div class="card"><h3>Peers</h3><div class="big">{{.Peers}}</div><p>devices offering storage</p></div>
+  <div class="card"><h3>Balance</h3>
+    {{with $.Balance}}<div class="big">{{money .AvailableUsd}}</div><p>{{money .EarnedUsd}} earned · {{money .PaidOutUsd}} paid out</p>
+    {{else}}<div class="big">-</div><p class="muted">billing service unavailable</p>{{end}}</div>
+  <div class="card"><h3>Payment method</h3><div class="big">{{if .PaymentMethod}}{{.PaymentMethod}}{{else}}-{{end}}</div><p>tier: {{.Tier}}</p></div>
+</section>
+
+<h2>Manage</h2>
+<div class="actions">
+  <form method="post" action="/users/{{.ID}}/status" data-confirm="Change this account's status?">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label>Account
+      <select name="status"><option value="active" {{if eq .Status "active"}}selected{{end}}>active</option><option value="suspended" {{if eq .Status "suspended"}}selected{{end}}>suspended</option></select>
+    </label>
+    <button {{if $.Self}}disabled title="You cannot change your own status"{{end}}>Save</button>
+  </form>
+  <form method="post" action="/users/{{.ID}}/tier">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label>Tier
+      <select name="tier"><option value="free" {{if eq .Tier "free"}}selected{{end}}>free</option><option value="paid" {{if eq .Tier "paid"}}selected{{end}}>paid</option></select>
+    </label>
+    <button>Save</button>
+  </form>
+  <form method="post" action="/users/{{.ID}}/quota">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label>Quota (GB) <input type="number" name="quota_gb" min="0" max="1000000" value="{{.QuotaGB}}"></label>
+    <button>Save</button>
+  </form>
+  <form method="post" action="/users/{{.ID}}/role" data-confirm="Change admin access for this account?">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label>Role
+      <select name="role"><option value="user" {{if eq .Role "user"}}selected{{end}}>user</option><option value="admin" {{if eq .Role "admin"}}selected{{end}}>admin</option></select>
+    </label>
+    <button {{if $.Self}}disabled title="You cannot change your own role"{{end}}>Save</button>
+  </form>
+  <form method="post" action="/users/{{.ID}}/password" data-confirm="Replace this user's password? Tell them the new one through a safe channel.">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <label>New password <input type="password" name="password" minlength="8" maxlength="72" autocomplete="new-password" required></label>
+    <button>Set password</button>
+  </form>
+</div>
+<p class="muted small">Suspending blocks new sign-ins and admin access at once; tokens already issued to the user's devices expire within their lifetime (60 minutes by default).</p>
+{{end}}
+
+<h2>Peers</h2>
+{{template "peertable" .Peers}}
+
+<h2>Files</h2>
+{{template "filetable" .Files}}
+
+<h2>Earnings</h2>
+{{if .Earnings}}
+<table><thead><tr><th>Period</th><th>Peer</th><th class="num">GB-days</th><th class="num">Bandwidth</th><th class="num">Net</th><th>Status</th></tr></thead>
+<tbody>{{range .Earnings}}<tr><td>{{.Period.Format "2006-01"}}</td><td><a href="/peers/{{.PeerID}}">{{short .PeerID}}</a></td>
+<td class="num">{{f1 .GBDays}}</td><td class="num">{{f1 .BandwidthGB}} GB</td><td class="num">{{money4 .Net}}</td>
+<td><span class="badge {{badge .Status}}">{{.Status}}</span></td></tr>{{end}}</tbody></table>
+{{else}}<p class="muted">No earnings yet.</p>{{end}}
+
+<h2>Payouts</h2>
+{{template "payouttable" .}}
+
+<h2>Admin history for this user</h2>
+{{template "logtable" .History}}
+{{end}}

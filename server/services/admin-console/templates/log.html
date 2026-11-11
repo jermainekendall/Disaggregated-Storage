@@ -1,0 +1,21 @@
+{{define "content"}}
+<h1>Admin log</h1>
+<p class="muted">Every change made in this console.</p>
+<form method="get" class="filters">
+  <input type="search" name="q" value="{{.Q}}" placeholder="action (e.g. user.), admin email or target id">
+  <button>Filter</button>
+</form>
+<table>
+<thead><tr><th>When</th><th>Admin</th><th>Action</th><th>Target</th><th>Details</th><th>From</th></tr></thead>
+<tbody>
+{{range .Entries}}<tr>
+  <td>{{time .When}}</td><td>{{.Email}}</td><td><code>{{.Action}}</code></td>
+  <td>{{if eq .Type "user"}}<a href="/users/{{.Target}}">user {{short .Target}}</a>{{else if eq .Type "peer"}}<a href="/peers/{{.Target}}">peer {{short .Target}}</a>{{else if eq .Type "file"}}<a href="/files/{{.Target}}">file {{short .Target}}</a>{{else}}{{.Type}} {{.Target}}{{end}}</td>
+  <td class="mono small">{{.Details}}</td><td class="small">{{.IP}}</td>
+</tr>{{else}}<tr><td colspan="6" class="muted">No entries.</td></tr>{{end}}
+</tbody></table>
+<div class="pager">
+  {{if gt .Page 1}}<a href="?q={{.Q}}&page={{sub .Page 1}}">← Newer</a>{{end}}
+  {{if .More}}<a href="?q={{.Q}}&page={{add .Page 1}}">Older →</a>{{end}}
+</div>
+{{end}}

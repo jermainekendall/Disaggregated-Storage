@@ -1,0 +1,47 @@
+{{define "content"}}
+{{$csrf := .CSRF}}
+<h1>Billing</h1>
+<p class="muted">Peers earn for the storage they hold (GB-days, at the rates in Settings) and the data they serve. Payments are simulated in this test deployment.</p>
+
+<nav class="tabs">
+  <a href="?period={{.Prev}}">← {{.Prev}}</a>
+  <span class="on">{{.PeriodName}}</span>
+  <a href="?period={{.Next}}">{{.Next}} →</a>
+</nav>
+
+<div class="actions">
+  <form method="post" action="/billing/run" data-confirm="Compute earnings for every peer for {{.PeriodName}}? Pending records are recalculated; approved ones are left alone.">
+    <input type="hidden" name="csrf" value="{{$csrf}}"><input type="hidden" name="period" value="{{.Period}}">
+    <button>Run billing for {{.PeriodName}}</button>
+  </form>
+  <form method="post" action="/billing/approve" data-confirm="Approve all {{.PendingCount}} pending earnings for {{.PeriodName}}?">
+    <input type="hidden" name="csrf" value="{{$csrf}}"><input type="hidden" name="period" value="{{.Period}}">
+    <button {{if not .PendingCount}}disabled{{end}}>Approve {{.PendingCount}} pending</button>
+  </form>
+</div>
+
+<section class="cards">
+  <div class="card"><h3>Peers billed</h3><div class="big">{{len .Earnings}}</div></div>
+  <div class="card"><h3>Storage</h3><div class="big">{{f1 .GBDays}}</div><p>GB-days</p></div>
+  <div class="card"><h3>Gross</h3><div class="big">{{money .Gross}}</div></div>
+  <div class="card"><h3>Net to peers</h3><div class="big">{{money .Net}}</div><p>after bonuses and audit penalties</p></div>
+</section>
+
+<h2>Earnings, {{.PeriodName}}</h2>
+{{if .Earnings}}
+<table><thead><tr><th>Peer</th><th>Owner</th><th class="num">GB-days</th><th class="num">Bandwidth</th><th class="num">Gross</th><th class="num">Net</th><th>Status</th></tr></thead>
+<tbody>{{range .Earnings}}<tr>
+  <td><a href="/peers/{{.PeerID}}" class="mono">{{short .PeerID}}</a></td><td>{{if .Email}}{{.Email}}{{else}}<span class="muted">unlinked</span>{{end}}</td>
+  <td class="num">{{f1 .GBDays}}</td><td class="num">{{f1 .BandwidthGB}} GB</td>
+  <td class="num">{{money4 .Gross}}</td><td class="num">{{money4 .Net}}</td>
+  <td><span class="badge {{badge .Status}}">{{.Status}}</span></td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="muted">No earnings computed for this month yet. The billing service bills the previous month automatically; use "Run billing" to compute it now.</p>{{end}}
+
+<h2>Payouts</h2>
+<nav class="tabs">
+  <a href="?period={{.Period}}&payouts=open" {{if eq .PayoutFilter "open"}}class="on"{{end}}>Open</a>
+  <a href="?period={{.Period}}&payouts=all" {{if eq .PayoutFilter "all"}}class="on"{{end}}>All</a>
+</nav>
+{{template "payouttable" .}}
+{{end}}

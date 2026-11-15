@@ -143,10 +143,19 @@ step "2/8 Go toolchain"
 # version_ge A B: true if version A >= version B (e.g. 1.24.7 >= 1.24)
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 
+# go_version_of GO: the version of that Go binary, or "" if it cannot tell.
+# It runs from / with GOTOOLCHAIN=local so an older Go does not try to
+# switch to the toolchain this module requires (which fails, or downloads),
+# and any error just means "not usable".
+go_version_of() {
+    (cd / && GOTOOLCHAIN=local "$1" version 2>/dev/null) \
+        | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p' | head -1 || true
+}
+
 GO=""
 for candidate in "$(command -v go 2>/dev/null || true)" /usr/local/go/bin/go; do
     [ -n "$candidate" ] && [ -x "$candidate" ] || continue
-    v=$("$candidate" env GOVERSION 2>/dev/null | sed 's/^go//')
+    v=$(go_version_of "$candidate")
     if [ -n "$v" ] && version_ge "$v" "$GO_MIN"; then
         GO="$candidate"
         ok "using Go $v at $candidate"
@@ -168,8 +177,8 @@ if [ -z "$GO" ]; then
     echo "$SUM  $TMP/$FILE" | sha256sum -c --quiet - || fail "checksum mismatch for $FILE; not installing"
     sudo rm -rf /usr/local/go
     sudo tar -C /usr/local -xzf "$TMP/$FILE"
-    # Put Go on PATH for future login shells.
-    echo 'export PATH=$PATH:/usr/local/go/bin' | sudo tee /etc/profile.d/go.sh >/dev/null
+    # Put Go on PATH for future login shells, ahead of Ubuntu's older golang package.
+    echo 'export PATH=/usr/local/go/bin:$PATH' | sudo tee /etc/profile.d/go.sh >/dev/null
     GO=/usr/local/go/bin/go
     ok "installed $("$GO" version)"
 fi

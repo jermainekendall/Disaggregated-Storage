@@ -1,6 +1,6 @@
 module github.com/jermainekendall/disaggregated-storage/server
 
-go 1.24
+go 1.24.0
 
 require (
 	github.com/gorilla/mux v1.8.1

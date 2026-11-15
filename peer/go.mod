@@ -1,6 +1,6 @@
 module github.com/jermainekendall/disaggregated-storage/peer
 
-go 1.24
+go 1.24.0
 
 // The gRPC stubs are shared with the server.
 replace github.com/jermainekendall/disaggregated-storage/server => ../server

@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"math/big"
 	"net/http"
+	"net/mail"
 	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/jermainekendall/disaggregated-storage/server/internal/common"
 
 	billingpb "github.com/jermainekendall/disaggregated-storage/server/proto/billing"
 )
@@ -274,6 +279,94 @@ func (s *server) handleUserRole(w http.ResponseWriter, r *http.Request) {
 	}
 	s.userUpdate(w, r, "user.role", `UPDATE users SET role = $2, updated_at = now() WHERE user_id = $1`,
 		map[string]interface{}{"role": role}, role)
+}
+
+// generatePassword returns a random 16-character password without
+// look-alike characters (0/O, 1/l/I).
+func generatePassword() (string, error) {
+	const alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	b := make([]byte, 16)
+	for i := range b {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphabet))))
+		if err != nil {
+			return "", err
+		}
+		b[i] = alphabet[n.Int64()]
+	}
+	return string(b), nil
+}
+
+// handleUserCreate adds an account. With an empty password field one is
+// generated and shown once on the response page (never in a URL or the log).
+func (s *server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
+	fail := func(msg string) { back(w, r, "/users", msg, true) }
+
+	addr, err := mail.ParseAddress(strings.TrimSpace(r.PostFormValue("email")))
+	if err != nil || addr.Name != "" || len(addr.Address) > 255 {
+		fail("enter a valid email address, e.g. name@example.com")
+		return
+	}
+	email := strings.ToLower(addr.Address)
+
+	tier := r.PostFormValue("tier")
+	if tier != "free" && tier != "paid" {
+		fail("tier must be free or paid")
+		return
+	}
+	role := r.PostFormValue("role")
+	if role != "user" && role != "admin" {
+		fail("role must be user or admin")
+		return
+	}
+	quota := 25
+	if v := strings.TrimSpace(r.PostFormValue("quota_gb")); v != "" {
+		q, err := strconv.Atoi(v)
+		if err != nil || q < 0 || q > 1000000 {
+			fail("quota must be a whole number of GB between 0 and 1000000")
+			return
+		}
+		quota = q
+	}
+
+	pw := r.PostFormValue("password")
+	generated := pw == ""
+	if generated {
+		if pw, err = generatePassword(); err != nil {
+			s.fail(w, r, err)
+			return
+		}
+	} else if len(pw) < 8 || len(pw) > 72 {
+		fail("password must be 8-72 characters (or leave it empty to generate one)")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	var id string
+	err = s.db.QueryRowContext(r.Context(), `
+		INSERT INTO users (email, password_hash, tier, role, storage_quota_gb)
+		VALUES ($1, $2, $3, $4, $5) RETURNING user_id`, email, string(hash), tier, role, quota).Scan(&id)
+	if common.IsUniqueViolation(err) {
+		fail("an account with " + email + " already exists")
+		return
+	}
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.audit(r, currentAdmin(r), "user.create", "user", id, map[string]interface{}{
+		"email": email, "tier": tier, "role": role, "quota_gb": quota, "password_generated": generated})
+
+	if !generated {
+		back(w, r, "/users/"+id, "Created "+email+". Give them their password through a safe channel.", false)
+		return
+	}
+	// Shown once: this response is not cached and the password is not stored anywhere readable.
+	s.render(w, r, "user_created.html", map[string]interface{}{
+		"ID": id, "Email": email, "Password": pw, "Role": role, "Tier": tier, "Quota": quota})
 }
 
 func (s *server) handleUserPassword(w http.ResponseWriter, r *http.Request) {

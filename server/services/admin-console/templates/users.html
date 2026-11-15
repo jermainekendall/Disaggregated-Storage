@@ -1,5 +1,25 @@
 {{define "content"}}
 <h1>Users</h1>
+
+<details class="panel" {{if .Err}}open{{end}}>
+  <summary>New user</summary>
+  <form method="post" action="/users" class="grid-form" data-confirm="Create this account?">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Email <input type="email" name="email" required autocomplete="off" maxlength="255"></label>
+    <label>Password
+      <input type="password" name="password" minlength="8" maxlength="72" autocomplete="new-password" placeholder="leave empty to generate one">
+    </label>
+    <label>Tier
+      <select name="tier"><option value="free" selected>free</option><option value="paid">paid</option></select>
+    </label>
+    <label>Storage quota (GB) <input type="number" name="quota_gb" min="0" max="1000000" value="25"></label>
+    <label>Role
+      <select name="role"><option value="user" selected>user</option><option value="admin">admin (console access)</option></select>
+    </label>
+    <div><button class="primary">Create user</button></div>
+  </form>
+  <p class="small muted">The account can sign in to the client (<code>orchestrator login</code>) straight away. A generated password is shown once, on the next page.</p>
+</details>
 <form method="get" class="filters">
   <input type="search" name="q" value="{{.Q}}" placeholder="search by email">
   <select name="status">

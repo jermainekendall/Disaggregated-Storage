@@ -98,7 +98,7 @@ From the console you can:
 | Page | What it is for |
 |---|---|
 | Dashboard | users, peers online, capacity, stored data, missing shards, open repairs, audit pass rate, pending billing |
-| Users | search; suspend or reactivate; change tier and storage quota; grant or remove admin; set a new password |
+| Users | create accounts (with a chosen or generated password); search; suspend or reactivate; change tier and storage quota; grant or remove admin; set a new password |
 | Peers | health, capacity, shards held and audit record; **drain** a peer (no new shards, and its shards are rebuilt elsewhere); set its health score |
 | Files | owner, code, shard map and health; queue a repair at top priority (names are encrypted and never shown) |
 | Repairs | open, failed and completed repair jobs; retry a failed one; replication job counts |
@@ -120,8 +120,11 @@ network. Before exposing it further, put it behind TLS (for example an ingress
 with a certificate) and set `COOKIE_SECURE=true` in
 `deployments/11-admin-console.yaml`.
 
-More admins: create the account through the normal sign-up, then grant it the
-admin role on its Users page.
+New accounts: open **Users → New user**, enter the email, tier, quota and role, and
+either type a password or leave it empty to have one generated. A generated
+password is shown once, on the confirmation page, and is never stored readably or
+logged. The account can sign in with `orchestrator login` straight away. Choose the
+`admin` role to give console access.
 
 ## How data flows
 

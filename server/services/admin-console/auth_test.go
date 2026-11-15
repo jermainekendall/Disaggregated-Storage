@@ -70,9 +70,21 @@ func TestTemplatesParse(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range []string{"dashboard.html", "users.html", "user.html", "peers.html", "peer.html", "files.html",
-		"file.html", "repairs.html", "audits.html", "billing.html", "settings.html", "log.html", "login.html"} {
+		"file.html", "repairs.html", "audits.html", "billing.html", "settings.html", "log.html", "login.html",
+		"user_created.html"} {
 		if pages[p] == nil {
 			t.Errorf("missing page %s", p)
 		}
+	}
+}
+
+func TestGeneratePassword(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 50; i++ {
+		p, err := generatePassword()
+		if err != nil || len(p) != 16 || strings.ContainsAny(p, "0O1lI") || seen[p] {
+			t.Fatalf("bad password %q: %v", p, err)
+		}
+		seen[p] = true
 	}
 }

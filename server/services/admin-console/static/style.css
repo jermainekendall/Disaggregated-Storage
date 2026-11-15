@@ -95,3 +95,12 @@ dl.facts dt { color: var(--muted); } dl.facts dd { margin: 0; word-break: break-
   table { display: block; overflow-x: auto; }
   dl.facts { grid-template-columns: 1fr; }
 }
+
+details.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 16px; margin: 12px 0 16px; }
+details.panel summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+details.panel[open] summary { margin-bottom: 10px; }
+.grid-form { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; align-items: end; }
+.grid-form label { display: flex; flex-direction: column; gap: 4px; }
+.panel.created { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 4px 16px 12px; }
+code.secret { font-size: 16px; padding: 4px 8px; background: var(--warn-bg); color: var(--warn); border-radius: 6px; user-select: all; }
+.panel.created dl.facts { border: 0; padding: 8px 0; margin: 4px 0; }

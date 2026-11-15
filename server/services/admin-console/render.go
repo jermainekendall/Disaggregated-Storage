@@ -210,6 +210,7 @@ func (s *server) routes() http.Handler {
 	a.HandleFunc("/", s.handleDashboard).Methods("GET")
 
 	a.HandleFunc("/users", s.handleUsers).Methods("GET")
+	a.HandleFunc("/users", s.handleUserCreate).Methods("POST")
 	a.HandleFunc("/users/{id}", s.handleUser).Methods("GET")
 	a.HandleFunc("/users/{id}/status", s.handleUserStatus).Methods("POST")
 	a.HandleFunc("/users/{id}/tier", s.handleUserTier).Methods("POST")

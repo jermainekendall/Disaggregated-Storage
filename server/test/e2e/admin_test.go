@@ -118,6 +118,83 @@ func TestAdminConsole(t *testing.T) {
 		}
 	})
 
+	t.Run("create users", func(t *testing.T) {
+		// The real gateway, to prove created accounts can sign in to the client API.
+		gwPort := freePort(t)
+		e.start("api-gateway", "PORT="+gwPort, "JWT_SECRET=test",
+			"PEER_REGISTRY_ADDR=127.0.0.1:1", "PLACEMENT_ADDR=127.0.0.1:1", "BILLING_ADDR="+billing)
+		gw := "http://127.0.0.1:" + gwPort
+		e.waitFor("gateway", 30*time.Second, func() bool {
+			r, err := http.Get(gw + "/ready")
+			if err != nil {
+				return false
+			}
+			r.Body.Close()
+			return r.StatusCode == 200
+		})
+		gatewayLogin := func(email, pw string) int {
+			resp, err := http.Post(gw+"/api/v1/auth/login", "application/json",
+				strings.NewReader(`{"email":"`+email+`","password":"`+pw+`"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			return resp.StatusCode
+		}
+
+		// With a chosen password: redirected to the new account's page.
+		_, final, body := b.act("/users", "/users", url.Values{"email": {"Bob@Example.com"},
+			"password": {"bobs-password-1"}, "tier": {"paid"}, "quota_gb": {"50"}, "role": {"user"}})
+		if !strings.Contains(final, "/users/") || !strings.Contains(body, "bob@example.com") {
+			t.Fatalf("create with password landed on %s", final)
+		}
+		var tier, role string
+		var quota int
+		e.db.QueryRow(`SELECT tier, role, storage_quota_gb FROM users WHERE email = 'bob@example.com'`).Scan(&tier, &role, &quota)
+		if tier != "paid" || role != "user" || quota != 50 {
+			t.Fatalf("bob is %s/%s/%d", tier, role, quota)
+		}
+		if code := gatewayLogin("bob@example.com", "bobs-password-1"); code != 200 {
+			t.Fatalf("created user cannot sign in to the gateway: %d", code)
+		}
+
+		// Generated password: shown once on the response page.
+		code, final, body := b.act("/users", "/users", url.Values{"email": {"carol@example.com"},
+			"password": {""}, "tier": {"free"}, "quota_gb": {""}, "role": {"user"}})
+		m := regexp.MustCompile(`class="secret">([A-Za-z0-9]{16})<`).FindStringSubmatch(body)
+		if code != 200 || m == nil || strings.Contains(final, m[1]) {
+			t.Fatalf("generated password not shown (or leaked into the URL %s)", final)
+		}
+		if code := gatewayLogin("carol@example.com", m[1]); code != 200 {
+			t.Fatalf("generated password does not work: %d", code)
+		}
+		e.db.QueryRow(`SELECT storage_quota_gb FROM users WHERE email = 'carol@example.com'`).Scan(&quota)
+		if quota != 25 {
+			t.Fatalf("default quota %d, want 25", quota)
+		}
+		var details string
+		e.db.QueryRow(`SELECT details::STRING FROM admin_audit_log WHERE action = 'user.create'
+			AND details->>'email' = 'carol@example.com'`).Scan(&details)
+		if details == "" || strings.Contains(details, m[1]) {
+			t.Fatalf("create not logged, or password in the log: %q", details)
+		}
+
+		// Rejected input.
+		for name, form := range map[string]url.Values{
+			"duplicate":      {"email": {"BOB@example.com"}, "password": {"another-pass-1"}, "tier": {"free"}, "role": {"user"}},
+			"bad email":      {"email": {"not-an-email"}, "password": {"another-pass-1"}, "tier": {"free"}, "role": {"user"}},
+			"short password": {"email": {"dan@example.com"}, "password": {"short"}, "tier": {"free"}, "role": {"user"}},
+			"bad role":       {"email": {"dan@example.com"}, "password": {"another-pass-1"}, "tier": {"free"}, "role": {"root"}},
+		} {
+			if _, final, _ := b.act("/users", "/users", form); !strings.Contains(final, "err=") {
+				t.Errorf("%s accepted", name)
+			}
+		}
+		if n := e.count(`SELECT count(*) FROM users WHERE email IN ('dan@example.com', 'not-an-email')`); n != 0 {
+			t.Fatalf("rejected accounts were created")
+		}
+	})
+
 	t.Run("every page renders", func(t *testing.T) {
 		pages := map[string]string{
 			"/":                   "Dashboard",
